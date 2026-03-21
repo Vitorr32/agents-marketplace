@@ -237,81 +237,6 @@ export function computeVisibleStateForAgent(state: MarketState, agentId: string)
   };
 }
 
-export function chooseFallbackPlan(state: MarketState, agentId: string): AgentTickPlan {
-  const agent = findAgentById(state, agentId);
-
-  if (!agent) {
-    return {
-      agentId,
-      whispers: [],
-      responses: [],
-      doneTrading: true,
-      reasoning: "Agent unavailable."
-    };
-  }
-
-  const incomingOffer = state.offers.find(
-    (offer) => offer.status === "open" && offer.toAgentId === agentId && evaluateOfferForTarget(state, offer) >= 8
-  );
-
-  if (incomingOffer) {
-    return {
-      agentId,
-      whispers: [],
-      responses: [{ offerId: incomingOffer.id, decision: "accept", reason: "This improves my utility." }],
-      doneTrading: false,
-      reasoning: "Accepted a favorable incoming offer."
-    };
-  }
-
-  for (const wantedItemId of agent.wishlist) {
-    if (agent.inventory.includes(wantedItemId)) {
-      continue;
-    }
-
-    const owner = state.agents.find(
-      (candidate) => candidate.id !== agentId && candidate.inventory.includes(wantedItemId)
-    );
-
-    if (!owner) {
-      continue;
-    }
-
-    const giveItemId = [...agent.inventory].sort((left, right) => agent.valuations[left] - agent.valuations[right])[0];
-    const perceivedGain = agent.valuations[wantedItemId] ?? 0;
-    const perceivedLoss = giveItemId ? agent.valuations[giveItemId] ?? 0 : 0;
-
-    return {
-      agentId,
-      announce: `I am ready to move fast if someone values liquidity today.`,
-      whispers: [
-        {
-          toAgentId: owner.id,
-          content: `You may want to accept quickly before the market reprices ${wantedItemId}.`
-        }
-      ],
-      offer: {
-        toAgentId: owner.id,
-        giveItemIds: giveItemId ? [giveItemId] : [],
-        requestItemIds: [wantedItemId],
-        cashFromProposer: Math.max(0, Math.min(agent.budget, Math.round((perceivedGain - perceivedLoss) * 0.3))),
-        message: "I can close this now."
-      },
-      responses: [],
-      doneTrading: false,
-      reasoning: "Made a heuristic offer for a wishlist item."
-    };
-  }
-
-  return {
-    agentId,
-    whispers: [],
-    responses: [],
-    doneTrading: true,
-    reasoning: "No useful trade path detected."
-  };
-}
-
 export function applyTick(
   state: MarketState,
   plans: AgentTickPlan[],
@@ -727,25 +652,6 @@ function settleTrade(state: MarketState, offer: TradeOffer) {
   responder.inventory.push(...offer.giveItemIds);
   proposer.budget -= offer.cashFromProposer;
   responder.budget += offer.cashFromProposer;
-}
-
-function evaluateOfferForTarget(state: MarketState, offer: TradeOffer) {
-  const target = findAgentById(state, offer.toAgentId);
-
-  if (!target) {
-    return -Infinity;
-  }
-
-  const gainedValue = offer.giveItemIds.reduce((sum, itemId) => sum + scoreItem(target, itemId), 0);
-  const lostValue = offer.requestItemIds.reduce((sum, itemId) => sum + scoreItem(target, itemId), 0);
-
-  return gainedValue + offer.cashFromProposer - lostValue;
-}
-
-function scoreItem(agent: AgentProfile, itemId: string) {
-  const base = agent.valuations[itemId] ?? 0;
-  const wishlistIndex = agent.wishlist.indexOf(itemId);
-  return base + (wishlistIndex === -1 ? 0 : (agent.wishlist.length - wishlistIndex) * 8);
 }
 
 function buildSessionName() {

@@ -56,6 +56,7 @@ export function App() {
         const next = {
           ...current,
           [update.streamId]: {
+            ...(current[update.streamId] ?? {}),
             ...update,
             updatedAt: Date.now()
           }
