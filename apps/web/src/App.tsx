@@ -10,7 +10,7 @@ type LlmStreamUpdate = {
   streamId: string;
   agentId: string;
   tickCount: number;
-  stage: "announcement" | "whisper-init" | "whisper-reply" | "trade-proposal" | "trade-response";
+  stage: "announcement" | "whisper-init" | "whisper-reply" | "trade-response";
   phase: "started" | "delta" | "completed" | "error";
   content: string;
 };
@@ -31,6 +31,18 @@ type WhisperWindow = {
 const socket = io({
   autoConnect: false
 });
+
+function formatCashSummary(cashFromProposer: number) {
+  if (cashFromProposer === 0) {
+    return "Cash: none";
+  }
+
+  if (cashFromProposer > 0) {
+    return `Cash: proposer pays $${cashFromProposer}`;
+  }
+
+  return `Cash: counterpart pays $${Math.abs(cashFromProposer)}`;
+}
 
 export function App() {
   const [state, setState] = useState<MarketState | null>(null);
@@ -216,7 +228,7 @@ export function App() {
           <p className="eyebrow">Multi-agent barter sandbox</p>
           <h1>Agents Marketplace</h1>
           <p className="lede">
-            Every tick, all agents act under imperfect information and the backend settles accepted trades.
+            Every tick, agents post public buy or sell orders, respond through whispers, and settle accepted trades immediately.
           </p>
         </div>
 
@@ -333,7 +345,7 @@ export function App() {
                     <div className="meta">
                       <span>Gives: {offer.giveItemIds.join(", ") || "nothing"}</span>
                       <span>Wants: {offer.requestItemIds.join(", ") || "nothing"}</span>
-                      <span>Cash: ${offer.cashFromProposer}</span>
+                      <span>{formatCashSummary(offer.cashFromProposer)}</span>
                     </div>
                   </div>
                 ))}

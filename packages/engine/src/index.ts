@@ -172,7 +172,7 @@ export function createSeedState(sessionId = randomUUID(), sessionName = buildSes
         round: 1,
         type: "system",
         visibility: "public",
-        content: "Market opened. Agents act on imperfect information and the backend settles valid accepted trades at the end of each tick.",
+        content: "Market opened. Agents post public buy or sell orders, negotiate privately, and valid accepted trades settle immediately.",
         createdAt: new Date().toISOString()
       }
     ]
@@ -347,7 +347,7 @@ export function applyTick(
           visibility: "public",
           actorAgentId: agent.id,
           targetAgentId: plan.offer.toAgentId,
-          content: `${agent.id} offered ${offer.giveItemIds.join(", ") || "nothing"} and $${offer.cashFromProposer} to ${offer.toAgentId} for ${offer.requestItemIds.join(", ") || "nothing"}.`,
+          content: formatOfferContent(offer),
           createdAt: timestamp
         });
       }
@@ -604,8 +604,12 @@ function validateNewOffer(state: MarketState, agentId: string, offer: TradeOffer
     return { ok: false, reason: "Agents cannot offer trades to themselves." };
   }
 
-  if (offer.cashFromProposer < 0 || proposer.budget < offer.cashFromProposer) {
+  if (offer.cashFromProposer >= 0 && proposer.budget < offer.cashFromProposer) {
     return { ok: false, reason: "Cash offer exceeds budget." };
+  }
+
+  if (offer.cashFromProposer < 0 && target.budget < Math.abs(offer.cashFromProposer)) {
+    return { ok: false, reason: "Requested cash exceeds the responder budget." };
   }
 
   if (!offer.giveItemIds.every((itemId) => proposer.inventory.includes(itemId))) {
@@ -631,8 +635,12 @@ function validateSettlement(state: MarketState, offer: TradeOffer) {
     return { ok: false, reason: "Responder no longer owns requested items." };
   }
 
-  if (proposer.budget < offer.cashFromProposer) {
+  if (offer.cashFromProposer >= 0 && proposer.budget < offer.cashFromProposer) {
     return { ok: false, reason: "Proposer cannot cover the cash portion." };
+  }
+
+  if (offer.cashFromProposer < 0 && responder.budget < Math.abs(offer.cashFromProposer)) {
+    return { ok: false, reason: "Responder cannot cover the cash portion." };
   }
 
   return { ok: true };
@@ -652,6 +660,21 @@ function settleTrade(state: MarketState, offer: TradeOffer) {
   responder.inventory.push(...offer.giveItemIds);
   proposer.budget -= offer.cashFromProposer;
   responder.budget += offer.cashFromProposer;
+}
+
+function formatOfferContent(offer: TradeOffer) {
+  const itemLeg = offer.giveItemIds.join(", ") || "nothing";
+  const requestLeg = offer.requestItemIds.join(", ") || "nothing";
+
+  if (offer.cashFromProposer === 0) {
+    return `${offer.fromAgentId} offered ${itemLeg} and no cash to ${offer.toAgentId} for ${requestLeg}.`;
+  }
+
+  if (offer.cashFromProposer > 0) {
+    return `${offer.fromAgentId} offered ${itemLeg} and $${offer.cashFromProposer} to ${offer.toAgentId} for ${requestLeg}.`;
+  }
+
+  return `${offer.fromAgentId} offered ${itemLeg} to ${offer.toAgentId} for ${requestLeg}, and asked ${offer.toAgentId} to pay $${Math.abs(offer.cashFromProposer)}.`;
 }
 
 function buildSessionName() {

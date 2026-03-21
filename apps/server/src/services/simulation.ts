@@ -17,9 +17,17 @@ type LlmStreamUpdate = {
   streamId: string;
   agentId: string;
   tickCount: number;
-  stage: "announcement" | "whisper-init" | "whisper-reply" | "trade-proposal" | "trade-response";
+  stage: "announcement" | "whisper-init" | "whisper-reply" | "trade-response";
   phase: "started" | "delta" | "completed" | "error";
   content: string;
+};
+
+type TradeProposalInput = {
+  targetAgentId: string;
+  giveItemIds: string[];
+  requestItemIds: string[];
+  cashFromProposer: number;
+  message: string;
 };
 
 export class SimulationService {
@@ -152,8 +160,7 @@ export class SimulationService {
       });
 
       await this.runAnnouncementPhase(workingState, emittedEvents, tickNumber, agentIds);
-      await this.runWhisperPhase(workingState, emittedEvents, tickNumber, agentIds);
-      const doneAgentIds = await this.runTradePhase(workingState, emittedEvents, tickNumber, agentIds);
+      const doneAgentIds = await this.runWhisperPhase(workingState, emittedEvents, tickNumber, agentIds);
 
       workingState.doneAgentIds = doneAgentIds;
       workingState.tickCount += 1;
@@ -205,14 +212,25 @@ export class SimulationService {
         this.createStreamCallbacks(tickNumber, agentId, "announcement")
       );
 
-      if (result.content) {
+      if (result.announcement) {
+        const validation = validateAnnouncementFromAgentPerspective(workingState, agentId, result.announcement);
+
+        if (!validation.ok) {
+          pushEvent(
+            workingState,
+            emittedEvents,
+            createDecisionEvent(workingState.round, agentId, `Announcement blocked by the game master: ${validation.reason}`)
+          );
+          continue;
+        }
+
         pushEvent(workingState, emittedEvents, {
           id: randomUUID(),
           round: workingState.round,
           type: "announce",
           visibility: "public",
           actorAgentId: agentId,
-          content: `${agentId} announced: ${result.content}`,
+          content: formatAnnouncementContent(agentId, result.announcement),
           createdAt: new Date().toISOString()
         });
       }
@@ -230,6 +248,8 @@ export class SimulationService {
     workingState.turnAgentId = "whispers";
     const priority = shuffle(agentIds);
     const closedPairs = new Set<string>();
+    const doneAgentIds: string[] = [];
+    const doneAgentIdSet = new Set<string>();
 
     pushEvent(workingState, emittedEvents, {
       id: randomUUID(),
@@ -241,7 +261,13 @@ export class SimulationService {
     });
 
     for (const initiatorId of priority) {
-      const unavailableTargets = priority.filter((candidate) => closedPairs.has(pairKey(initiatorId, candidate)));
+      if (doneAgentIdSet.has(initiatorId)) {
+        continue;
+      }
+
+      const unavailableTargets = priority.filter(
+        (candidate) => closedPairs.has(pairKey(initiatorId, candidate)) || doneAgentIdSet.has(candidate)
+      );
       const start = await this.runtime.generateWhisperStart(
         workingState,
         initiatorId,
@@ -249,7 +275,14 @@ export class SimulationService {
         this.createStreamCallbacks(tickNumber, initiatorId, "whisper-init")
       );
 
-      if (!start.whisper) {
+      if (start.kind === "done") {
+        doneAgentIds.push(initiatorId);
+        doneAgentIdSet.add(initiatorId);
+        pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, initiatorId, start.trace));
+        continue;
+      }
+
+      if (start.kind === "pass") {
         pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, initiatorId, start.trace));
         continue;
       }
@@ -258,6 +291,7 @@ export class SimulationService {
       if (
         targetId === initiatorId ||
         !findAgentById(workingState, targetId) ||
+        doneAgentIdSet.has(targetId) ||
         closedPairs.has(pairKey(initiatorId, targetId))
       ) {
         pushEvent(
@@ -280,6 +314,12 @@ export class SimulationService {
       });
       pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, initiatorId, start.trace));
 
+      if (start.whisper.offer) {
+        await this.processTradeProposal(workingState, emittedEvents, tickNumber, initiatorId, start.whisper.offer, {
+          blockedPrefix: "Direct whisper offer blocked by the game master"
+        });
+      }
+
       const transcript = [{ speakerId: initiatorId, message: start.whisper.message }];
       let currentSpeaker = targetId;
       let otherSpeaker = initiatorId;
@@ -296,11 +336,11 @@ export class SimulationService {
 
         pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, currentSpeaker, reply.trace));
 
-        if (!reply.message) {
+        if (!reply.whisper) {
           break;
         }
 
-        transcript.push({ speakerId: currentSpeaker, message: reply.message });
+        transcript.push({ speakerId: currentSpeaker, message: reply.whisper.message });
         pushEvent(workingState, emittedEvents, {
           id: randomUUID(),
           round: workingState.round,
@@ -308,9 +348,15 @@ export class SimulationService {
           visibility: "private",
           actorAgentId: currentSpeaker,
           targetAgentId: otherSpeaker,
-          content: `${currentSpeaker} whispered to ${otherSpeaker}: ${reply.message}`,
+          content: `${currentSpeaker} whispered to ${otherSpeaker}: ${reply.whisper.message}`,
           createdAt: new Date().toISOString()
         });
+
+        if (reply.whisper.offer) {
+          await this.processTradeProposal(workingState, emittedEvents, tickNumber, currentSpeaker, reply.whisper.offer, {
+            blockedPrefix: "Direct whisper offer blocked by the game master"
+          });
+        }
 
         exchanged += 1;
         [currentSpeaker, otherSpeaker] = [otherSpeaker, currentSpeaker];
@@ -318,120 +364,80 @@ export class SimulationService {
 
       closedPairs.add(pairKey(initiatorId, targetId));
     }
+
+    return doneAgentIds;
   }
 
-  private async runTradePhase(
+  private async processTradeProposal(
     workingState: MarketState,
     emittedEvents: MarketEvent[],
     tickNumber: number,
-    agentIds: string[]
+    proposerId: string,
+    proposal: TradeProposalInput,
+    options: {
+      blockedPrefix: string;
+      proposalTrace?: string;
+    }
   ) {
-    workingState.turnAgentId = "trades";
-    const doneAgentIds: string[] = [];
+    const validation = validateTradeFromProposerPerspective(workingState, proposerId, proposal);
 
-    for (const agentId of agentIds) {
-      const result = await this.runtime.generateTradeProposal(
+    if (!validation.ok) {
+      pushEvent(
         workingState,
-        agentId,
-        this.createStreamCallbacks(tickNumber, agentId, "trade-proposal")
+        emittedEvents,
+        createDecisionEvent(workingState.round, proposerId, `${options.blockedPrefix}: ${validation.reason}`)
       );
+      return;
+    }
 
-      if (result.kind === "done") {
-        doneAgentIds.push(agentId);
-        pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, result.trace));
-        continue;
-      }
+    const offer: TradeOffer = {
+      id: randomUUID(),
+      fromAgentId: proposerId,
+      toAgentId: proposal.targetAgentId,
+      giveItemIds: [...proposal.giveItemIds],
+      requestItemIds: [...proposal.requestItemIds],
+      cashFromProposer: proposal.cashFromProposer,
+      status: "open",
+      message: proposal.message,
+      createdAt: new Date().toISOString()
+    };
 
-      if (result.kind === "pass") {
-        pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, result.trace));
-        continue;
-      }
+    workingState.offers.unshift(offer);
+    pushEvent(workingState, emittedEvents, {
+      id: randomUUID(),
+      round: workingState.round,
+      type: "offer",
+      visibility: "public",
+      actorAgentId: offer.fromAgentId,
+      targetAgentId: offer.toAgentId,
+      content: formatOfferContent(offer),
+      createdAt: new Date().toISOString()
+    });
 
-      const validation = validateTradeFromProposerPerspective(workingState, agentId, result.proposal);
+    if (options.proposalTrace) {
+      pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, proposerId, options.proposalTrace));
+    }
 
-      if (!validation.ok) {
-        pushEvent(
-          workingState,
-          emittedEvents,
-          createDecisionEvent(workingState.round, agentId, `Trade blocked by the game master: ${validation.reason}`)
-        );
-        continue;
-      }
+    const response = await this.runtime.generateTradeResponse(
+      workingState,
+      offer.toAgentId,
+      {
+        fromAgentId: offer.fromAgentId,
+        giveItemIds: offer.giveItemIds,
+        requestItemIds: offer.requestItemIds,
+        cashFromProposer: offer.cashFromProposer,
+        message: offer.message
+      },
+      this.createStreamCallbacks(tickNumber, offer.toAgentId, "trade-response")
+    );
 
-      const offer: TradeOffer = {
-        id: randomUUID(),
-        fromAgentId: agentId,
-        toAgentId: result.proposal.targetAgentId,
-        giveItemIds: [...result.proposal.giveItemIds],
-        requestItemIds: [...result.proposal.requestItemIds],
-        cashFromProposer: result.proposal.cashFromProposer,
-        status: "open",
-        message: result.proposal.message,
-        createdAt: new Date().toISOString()
-      };
+    pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, offer.toAgentId, response.trace));
 
-      workingState.offers.unshift(offer);
-      pushEvent(workingState, emittedEvents, {
-        id: randomUUID(),
-        round: workingState.round,
-        type: "offer",
-        visibility: "public",
-        actorAgentId: offer.fromAgentId,
-        targetAgentId: offer.toAgentId,
-        content: `${offer.fromAgentId} offered ${offer.giveItemIds.join(", ") || "nothing"} and $${offer.cashFromProposer} to ${offer.toAgentId} for ${offer.requestItemIds.join(", ") || "nothing"}.`,
-        createdAt: new Date().toISOString()
-      });
-      pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, result.trace));
+    if (response.decision === "accept") {
+      const settlement = validateTradeForSettlement(workingState, offer);
 
-      const response = await this.runtime.generateTradeResponse(
-        workingState,
-        offer.toAgentId,
-        {
-          fromAgentId: offer.fromAgentId,
-          giveItemIds: offer.giveItemIds,
-          requestItemIds: offer.requestItemIds,
-          cashFromProposer: offer.cashFromProposer,
-          message: offer.message
-        },
-        this.createStreamCallbacks(tickNumber, offer.toAgentId, "trade-response")
-      );
-
-      pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, offer.toAgentId, response.trace));
-
-      if (response.decision === "accept") {
-        const settlement = validateTradeForSettlement(workingState, offer);
-
-        if (!settlement.ok) {
-          offer.status = "invalid";
-          offer.respondedAt = new Date().toISOString();
-          pushEvent(
-            workingState,
-            emittedEvents,
-            createDecisionEvent(
-              workingState.round,
-              offer.toAgentId,
-              `${offer.toAgentId} rejected ${offer.fromAgentId}'s offer: ${settlement.reason}`
-            )
-          );
-          continue;
-        }
-
-        settleTrade(workingState, offer);
-        offer.status = "settled";
-        offer.respondedAt = new Date().toISOString();
-        offer.settledAt = offer.respondedAt;
-        pushEvent(workingState, emittedEvents, {
-          id: randomUUID(),
-          round: workingState.round,
-          type: "trade",
-          visibility: "public",
-          actorAgentId: offer.fromAgentId,
-          targetAgentId: offer.toAgentId,
-          content: `${offer.toAgentId} accepted ${offer.fromAgentId}'s offer and the trade settled immediately.`,
-          createdAt: new Date().toISOString()
-        });
-      } else {
-        offer.status = "rejected";
+      if (!settlement.ok) {
+        offer.status = "invalid";
         offer.respondedAt = new Date().toISOString();
         pushEvent(
           workingState,
@@ -439,13 +445,40 @@ export class SimulationService {
           createDecisionEvent(
             workingState.round,
             offer.toAgentId,
-            `${offer.toAgentId} rejected ${offer.fromAgentId}'s offer: ${response.reason}`
+            `${offer.toAgentId} rejected ${offer.fromAgentId}'s offer: ${settlement.reason}`
           )
         );
+        return;
       }
+
+      settleTrade(workingState, offer);
+      offer.status = "settled";
+      offer.respondedAt = new Date().toISOString();
+      offer.settledAt = offer.respondedAt;
+      pushEvent(workingState, emittedEvents, {
+        id: randomUUID(),
+        round: workingState.round,
+        type: "trade",
+        visibility: "public",
+        actorAgentId: offer.fromAgentId,
+        targetAgentId: offer.toAgentId,
+        content: `${offer.toAgentId} accepted ${offer.fromAgentId}'s offer and the trade settled immediately.`,
+        createdAt: new Date().toISOString()
+      });
+      return;
     }
 
-    return doneAgentIds;
+    offer.status = "rejected";
+    offer.respondedAt = new Date().toISOString();
+    pushEvent(
+      workingState,
+      emittedEvents,
+      createDecisionEvent(
+        workingState.round,
+        offer.toAgentId,
+        `${offer.toAgentId} rejected ${offer.fromAgentId}'s offer: ${response.reason}`
+      )
+    );
   }
 
   private createStreamCallbacks(
@@ -567,6 +600,37 @@ function pairKey(left: string, right: string) {
   return [left, right].sort().join("::");
 }
 
+function validateAnnouncementFromAgentPerspective(
+  state: MarketState,
+  agentId: string,
+  announcement: {
+    orderType: "buy" | "sell";
+    itemId: string;
+    price: number;
+    note: string | null;
+  }
+) {
+  const agent = findAgentById(state, agentId);
+
+  if (!agent) {
+    return { ok: false, reason: "Unknown agent." };
+  }
+
+  if (announcement.price < 0) {
+    return { ok: false, reason: "Announcement price must be non-negative." };
+  }
+
+  if (announcement.orderType === "sell" && !agent.inventory.includes(announcement.itemId)) {
+    return { ok: false, reason: "Sell orders must reference an item you currently own." };
+  }
+
+  if (announcement.orderType === "buy" && agent.budget < announcement.price) {
+    return { ok: false, reason: "Buy orders must be affordable from your current budget." };
+  }
+
+  return { ok: true };
+}
+
 function validateTradeFromProposerPerspective(
   state: MarketState,
   proposerId: string,
@@ -589,8 +653,12 @@ function validateTradeFromProposerPerspective(
     return { ok: false, reason: "Agents cannot trade with themselves." };
   }
 
-  if (proposal.cashFromProposer < 0 || proposer.budget < proposal.cashFromProposer) {
+  if (proposal.cashFromProposer >= 0 && proposer.budget < proposal.cashFromProposer) {
     return { ok: false, reason: "Proposer cannot cover the offered cash." };
+  }
+
+  if (proposal.cashFromProposer < 0 && target.budget < Math.abs(proposal.cashFromProposer)) {
+    return { ok: false, reason: "Target cannot currently cover the requested cash." };
   }
 
   if (!proposal.giveItemIds.every((itemId) => proposer.inventory.includes(itemId))) {
@@ -616,8 +684,12 @@ function validateTradeForSettlement(state: MarketState, offer: TradeOffer) {
     return { ok: false, reason: "I do not currently have what you are asking for." };
   }
 
-  if (proposer.budget < offer.cashFromProposer) {
+  if (offer.cashFromProposer >= 0 && proposer.budget < offer.cashFromProposer) {
     return { ok: false, reason: "The proposer can no longer fund the cash side of the deal." };
+  }
+
+  if (offer.cashFromProposer < 0 && target.budget < Math.abs(offer.cashFromProposer)) {
+    return { ok: false, reason: "I can no longer fund the cash side of the deal." };
   }
 
   return { ok: true };
@@ -637,4 +709,32 @@ function settleTrade(state: MarketState, offer: TradeOffer) {
   target.inventory.push(...offer.giveItemIds);
   proposer.budget -= offer.cashFromProposer;
   target.budget += offer.cashFromProposer;
+}
+
+function formatAnnouncementContent(
+  agentId: string,
+  announcement: {
+    orderType: "buy" | "sell";
+    itemId: string;
+    price: number;
+    note: string | null;
+  }
+) {
+  const note = announcement.note ? `. ${announcement.note}` : "";
+  return `${agentId} announced: ${announcement.orderType.toUpperCase()} ${announcement.itemId} for $${announcement.price}${note}`;
+}
+
+function formatOfferContent(offer: TradeOffer) {
+  const itemLeg = offer.giveItemIds.join(", ") || "nothing";
+  const requestLeg = offer.requestItemIds.join(", ") || "nothing";
+
+  if (offer.cashFromProposer === 0) {
+    return `${offer.fromAgentId} offered ${itemLeg} and no cash to ${offer.toAgentId} for ${requestLeg}.`;
+  }
+
+  if (offer.cashFromProposer > 0) {
+    return `${offer.fromAgentId} offered ${itemLeg} and $${offer.cashFromProposer} to ${offer.toAgentId} for ${requestLeg}.`;
+  }
+
+  return `${offer.fromAgentId} offered ${itemLeg} to ${offer.toAgentId} for ${requestLeg}, and asked ${offer.toAgentId} to pay $${Math.abs(offer.cashFromProposer)}.`;
 }
