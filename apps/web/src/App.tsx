@@ -6,6 +6,19 @@ type SimulationUpdate = {
   state: MarketState;
 };
 
+type LlmStreamUpdate = {
+  streamId: string;
+  agentId: string;
+  tickCount: number;
+  stage: "announcement" | "whisper-init" | "whisper-reply" | "trade-proposal" | "trade-response";
+  phase: "started" | "delta" | "completed" | "error";
+  content: string;
+};
+
+type LiveStream = LlmStreamUpdate & {
+  updatedAt: number;
+};
+
 const socket = io({
   autoConnect: false
 });
@@ -14,6 +27,7 @@ export function App() {
   const [state, setState] = useState<MarketState | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedReplay, setSelectedReplay] = useState<SessionReplay | null>(null);
+  const [liveStreams, setLiveStreams] = useState<Record<string, LiveStream>>({});
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -27,9 +41,27 @@ export function App() {
         void loadSessions();
       }
     });
+    socket.on("simulation:llm-stream", (update: LlmStreamUpdate) => {
+      setLiveStreams((current) => {
+        const next = {
+          ...current,
+          [update.streamId]: {
+            ...update,
+            updatedAt: Date.now()
+          }
+        };
+
+        return Object.fromEntries(
+          Object.entries(next)
+            .sort((left, right) => right[1].updatedAt - left[1].updatedAt)
+            .slice(0, 12)
+        );
+      });
+    });
 
     return () => {
       socket.off("simulation:update");
+      socket.off("simulation:llm-stream");
       socket.disconnect();
     };
   }, []);
@@ -75,6 +107,8 @@ export function App() {
     return <main className="shell">Loading simulation...</main>;
   }
 
+  const orderedStreams = Object.values(liveStreams).sort((left, right) => right.updatedAt - left.updatedAt);
+
   return (
     <main className="shell">
       <section className="hero">
@@ -82,7 +116,7 @@ export function App() {
           <p className="eyebrow">Multi-agent barter sandbox</p>
           <h1>Agents Marketplace</h1>
           <p className="lede">
-            Agents negotiate, bluff, whisper, and trade under deterministic market rules.
+            Every tick, all agents act under imperfect information and the backend settles accepted trades.
           </p>
         </div>
 
@@ -98,7 +132,7 @@ export function App() {
             </strong>
           </div>
           <div className="stat">
-            <span>Turn</span>
+            <span>Phase</span>
             <strong>{state.turnAgentId}</strong>
           </div>
           <div className="stat">
@@ -127,7 +161,7 @@ export function App() {
           <div className="panel-head">
             <h2>Agents</h2>
             <span>
-              {state.agents.length} active, {state.doneAgentIds.length} marked done
+              {state.agents.length} active, {state.doneAgentIds.length} done this tick
             </span>
           </div>
 
@@ -183,6 +217,19 @@ export function App() {
           </div>
 
           <div className="feed">
+            {orderedStreams.map((stream) => (
+              <div className="feed-item stream-item" key={stream.streamId}>
+                <div className="agent-row">
+                  <strong>
+                    {stream.agentId} {stream.stage}
+                  </strong>
+                  <span className={`badge badge-${stream.phase}`}>{stream.phase}</span>
+                </div>
+                <p className="stream-meta">Tick {stream.tickCount}</p>
+                <pre className="stream-content">{stream.content || "Waiting for tokens..."}</pre>
+              </div>
+            ))}
+
             {state.events.map((event) => (
               <div className="feed-item" key={event.id}>
                 <div className="agent-row">

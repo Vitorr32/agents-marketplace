@@ -10,6 +10,7 @@ const app = Fastify({
 });
 
 const simulation = new SimulationService();
+await simulation.initialize(app.log);
 
 await app.register(cors, {
   origin: config.webOrigin,

@@ -1,6 +1,6 @@
 # Agents Marketplace
 
-A local multi-agent trading sandbox where AI agents negotiate over scarce items, budgets, and perceived value. Agents can announce publicly, whisper privately, bluff in dialogue, and settle trades through deterministic backend rules.
+A local multi-agent trading sandbox where AI agents negotiate over scarce items, budgets, and perceived value. Agents act each tick with imperfect information, can announce publicly, whisper privately, bluff in dialogue, and settle accepted trades through deterministic backend rules.
 
 ## Stack
 
@@ -29,6 +29,7 @@ That one command starts:
 - web app on `http://localhost:5173`
 - server on `http://localhost:3001`
 - SQLite persistence automatically inside `apps/server/data/agents-marketplace.db`
+- Ollama model warm-up for `llama3.2` during server startup
 
 ## Ollama
 
@@ -45,11 +46,13 @@ If Ollama is unavailable or returns malformed output, the server falls back to a
 ## Current behavior
 
 - seeded with 4 agents and 8 items
-- supports `announce`, `whisper`, `propose_trade`, `accept_trade`, `reject_trade`, and `pass`
-- uses a turn-based simulation loop
+- each tick asks every agent for one structured plan through Ollama
+- supports one public announcement, one public trade offer, private whispers, and offer accept/reject decisions per tick
+- keeps inventories, budgets, and valuations private to each agent
+- settles accepted trades only after the full tick is collected
 - broadcasts live state over WebSockets to the UI
 - persists sessions and replayable event logs in local SQLite
-- ends a session at 1000 ticks or when every agent passes in sequence and the market goes inactive
+- ends a session at 1000 ticks or when every agent marks itself done trading on the same tick
 
 ## Replay
 

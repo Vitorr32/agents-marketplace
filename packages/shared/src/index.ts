@@ -15,6 +15,8 @@ export type Item = {
   category: string;
 };
 
+export type TradeOfferStatus = "open" | "accepted" | "rejected" | "settled" | "invalid";
+
 export type TradeOffer = {
   id: string;
   fromAgentId: string;
@@ -22,20 +24,51 @@ export type TradeOffer = {
   giveItemIds: string[];
   requestItemIds: string[];
   cashFromProposer: number;
-  status: "open" | "accepted" | "rejected";
+  status: TradeOfferStatus;
   message: string;
   createdAt: string;
+  respondedAt?: string;
+  settledAt?: string;
 };
 
 export type MarketEvent = {
   id: string;
   round: number;
-  type: "system" | "announce" | "whisper" | "offer" | "trade" | "decision";
+  type: "system" | "tick" | "announce" | "whisper" | "offer" | "trade" | "decision";
   visibility: "public" | "private";
   actorAgentId?: string;
   targetAgentId?: string;
   content: string;
   createdAt: string;
+};
+
+export type OfferResponseIntent = {
+  offerId: string;
+  decision: "accept" | "reject";
+  reason: string;
+};
+
+export type TradeOfferIntent = {
+  toAgentId: string;
+  giveItemIds: string[];
+  requestItemIds: string[];
+  cashFromProposer: number;
+  message: string;
+};
+
+export type WhisperIntent = {
+  toAgentId: string;
+  content: string;
+};
+
+export type AgentTickPlan = {
+  agentId: string;
+  announce?: string;
+  whispers: WhisperIntent[];
+  offer?: TradeOfferIntent;
+  responses: OfferResponseIntent[];
+  doneTrading: boolean;
+  reasoning: string;
 };
 
 export type MarketState = {
@@ -71,41 +104,3 @@ export type SessionReplay = {
   session: SessionSummary;
   events: MarketEvent[];
 };
-
-export type SimulationAction =
-  | {
-      type: "announce";
-      agentId: string;
-      content: string;
-    }
-  | {
-      type: "whisper";
-      agentId: string;
-      toAgentId: string;
-      content: string;
-    }
-  | {
-      type: "propose_trade";
-      agentId: string;
-      toAgentId: string;
-      giveItemIds: string[];
-      requestItemIds: string[];
-      cashFromProposer: number;
-      message: string;
-    }
-  | {
-      type: "accept_trade";
-      agentId: string;
-      offerId: string;
-    }
-  | {
-      type: "reject_trade";
-      agentId: string;
-      offerId: string;
-      reason: string;
-    }
-  | {
-      type: "pass";
-      agentId: string;
-      reasoning: string;
-    };

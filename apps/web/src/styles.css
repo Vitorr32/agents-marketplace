@@ -202,6 +202,34 @@ button:disabled {
   color: #86e59e;
 }
 
+.badge-started,
+.badge-delta {
+  background: rgba(95, 168, 211, 0.16);
+  color: #9ed7ff;
+}
+
+.badge-error {
+  background: rgba(242, 92, 84, 0.2);
+  color: #ff9a93;
+}
+
+.stream-item {
+  border-color: rgba(95, 168, 211, 0.25);
+}
+
+.stream-meta {
+  margin-bottom: 0.5rem;
+  color: var(--muted);
+}
+
+.stream-content {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 0.88rem/1.45 "Consolas", "SFMono-Regular", monospace;
+  color: #d7e8f7;
+}
+
 .replay-panel {
   grid-column: 1 / -1;
 }

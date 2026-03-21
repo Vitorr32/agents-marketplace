@@ -1,16 +1,31 @@
 import { randomUUID } from "node:crypto";
 import type {
   AgentProfile,
+  AgentTickPlan,
   Item,
   MarketEvent,
   MarketState,
-  SimulationAction,
-  TradeOffer
+  OfferResponseIntent,
+  TradeOffer,
+  TradeOfferIntent,
+  WhisperIntent
 } from "@agents-marketplace/shared";
 
-export type { AgentProfile, Item, MarketEvent, MarketState, SimulationAction, TradeOffer };
+export type {
+  AgentProfile,
+  AgentTickPlan,
+  Item,
+  MarketEvent,
+  MarketState,
+  OfferResponseIntent,
+  TradeOffer,
+  TradeOfferIntent,
+  WhisperIntent
+};
 
 const MAX_TICKS = 1000;
+const MAX_WHISPERS_PER_TARGET_PER_TICK = 10;
+const AGENT_CONTEXT_TICK_WINDOW = 10;
 
 const ITEMS: Item[] = [
   { id: "saffron", name: "Saffron", description: "Rare spice cache.", category: "luxury" },
@@ -98,7 +113,41 @@ const SEED_AGENTS: AgentProfile[] = [
   }
 ];
 
-export type AppliedActionResult = {
+export type AgentVisibleState = {
+  round: number;
+  tickCount: number;
+  maxTicks: number;
+  self: {
+    id: string;
+    name: string;
+    persona: string;
+    budget: number;
+    inventory: string[];
+    wishlist: string[];
+    valuations: Record<string, number>;
+    doneTrading: boolean;
+  } | null;
+  publicAgents: Array<{
+    id: string;
+    name: string;
+    persona: string;
+    doneTrading: boolean;
+  }>;
+  items: Item[];
+  openOffers: TradeOffer[];
+  incomingOffers: TradeOffer[];
+  outgoingOffers: TradeOffer[];
+  publicAnnouncements: MarketEvent[];
+  privateWhispers: MarketEvent[];
+  publicTradeEvents: MarketEvent[];
+  constraints: {
+    maxAnnouncementsPerTick: 1;
+    maxOffersPerTick: 1;
+    maxWhispersPerTargetPerTick: number;
+  };
+};
+
+export type AppliedTickResult = {
   state: MarketState;
   emittedEvents: MarketEvent[];
 };
@@ -112,7 +161,7 @@ export function createSeedState(sessionId = randomUUID(), sessionName = buildSes
     maxTicks: MAX_TICKS,
     isRunning: false,
     status: "paused",
-    turnAgentId: SEED_AGENTS[0].id,
+    turnAgentId: "all-agents",
     doneAgentIds: [],
     items: ITEMS,
     agents: structuredClone(SEED_AGENTS),
@@ -123,7 +172,7 @@ export function createSeedState(sessionId = randomUUID(), sessionName = buildSes
         round: 1,
         type: "system",
         visibility: "public",
-        content: "Market opened. Agents may bluff in messages, but all settlements are deterministic.",
+        content: "Market opened. Agents act on imperfect information and the backend settles valid accepted trades at the end of each tick.",
         createdAt: new Date().toISOString()
       }
     ]
@@ -134,57 +183,71 @@ export function findAgentById(state: MarketState, agentId: string) {
   return state.agents.find((agent) => agent.id === agentId);
 }
 
-export function getNextAgentId(state: MarketState) {
-  if (state.agents.length === 0) {
-    return null;
-  }
-
-  if (state.agents.some((agent) => agent.id === state.turnAgentId)) {
-    return state.turnAgentId;
-  }
-
-  return state.agents[0].id;
+export function getActiveAgentIds(state: MarketState) {
+  return state.agents.map((agent) => agent.id);
 }
 
-export function canAgentAffordCash(state: MarketState, agentId: string, amount: number) {
-  const agent = findAgentById(state, agentId);
-  return !!agent && amount >= 0 && agent.budget >= amount;
-}
-
-export function computeVisibleStateForAgent(state: MarketState, agentId: string) {
+export function computeVisibleStateForAgent(state: MarketState, agentId: string): AgentVisibleState {
   const self = findAgentById(state, agentId);
+  const cutoffRound = Math.max(1, state.round - AGENT_CONTEXT_TICK_WINDOW);
+  const recentEvents = state.events.filter((event) => event.round >= cutoffRound);
 
   return {
     round: state.round,
-    turnAgentId: state.turnAgentId,
-    self,
+    tickCount: state.tickCount,
+    maxTicks: state.maxTicks,
+    self: self
+      ? {
+          id: self.id,
+          name: self.name,
+          persona: self.persona,
+          budget: self.budget,
+          inventory: [...self.inventory],
+          wishlist: [...self.wishlist],
+          valuations: { ...self.valuations },
+          doneTrading: state.doneAgentIds.includes(self.id)
+        }
+      : null,
     publicAgents: state.agents.map((agent) => ({
       id: agent.id,
       name: agent.name,
       persona: agent.persona,
-      budget: agent.budget,
-      inventoryCount: agent.inventory.length
+      doneTrading: state.doneAgentIds.includes(agent.id)
     })),
     items: state.items,
-    openOffers: state.offers.filter(
-      (offer) => offer.status === "open" && (offer.fromAgentId === agentId || offer.toAgentId === agentId)
-    ),
-    publicEvents: state.events.filter((event) => event.visibility === "public").slice(0, 20),
-    privateEvents: state.events
+    openOffers: state.offers.filter((offer) => offer.status === "open"),
+    incomingOffers: state.offers.filter((offer) => offer.status === "open" && offer.toAgentId === agentId),
+    outgoingOffers: state.offers.filter((offer) => offer.status === "open" && offer.fromAgentId === agentId),
+    publicAnnouncements: recentEvents.filter((event) => event.type === "announce").slice(0, 40),
+    privateWhispers: recentEvents
       .filter(
         (event) =>
-          event.visibility === "private" &&
+          event.type === "whisper" &&
           (event.actorAgentId === agentId || event.targetAgentId === agentId)
       )
-      .slice(0, 20)
+      .slice(0, 80),
+    publicTradeEvents: recentEvents
+      .filter((event) => event.visibility === "public" && (event.type === "offer" || event.type === "trade"))
+      .slice(0, 80),
+    constraints: {
+      maxAnnouncementsPerTick: 1,
+      maxOffersPerTick: 1,
+      maxWhispersPerTargetPerTick: MAX_WHISPERS_PER_TARGET_PER_TICK
+    }
   };
 }
 
-export function chooseFallbackAction(state: MarketState, agentId: string): SimulationAction {
+export function chooseFallbackPlan(state: MarketState, agentId: string): AgentTickPlan {
   const agent = findAgentById(state, agentId);
 
   if (!agent) {
-    return { type: "pass", agentId, reasoning: "Agent unavailable." };
+    return {
+      agentId,
+      whispers: [],
+      responses: [],
+      doneTrading: true,
+      reasoning: "Agent unavailable."
+    };
   }
 
   const incomingOffer = state.offers.find(
@@ -192,174 +255,290 @@ export function chooseFallbackAction(state: MarketState, agentId: string): Simul
   );
 
   if (incomingOffer) {
-    return { type: "accept_trade", agentId, offerId: incomingOffer.id };
+    return {
+      agentId,
+      whispers: [],
+      responses: [{ offerId: incomingOffer.id, decision: "accept", reason: "This improves my utility." }],
+      doneTrading: false,
+      reasoning: "Accepted a favorable incoming offer."
+    };
   }
 
-  const desiredItems = agent.wishlist.filter((itemId) => !agent.inventory.includes(itemId));
+  for (const wantedItemId of agent.wishlist) {
+    if (agent.inventory.includes(wantedItemId)) {
+      continue;
+    }
 
-  for (const targetItemId of desiredItems) {
-    const owner = state.agents.find((candidate) => candidate.id !== agentId && candidate.inventory.includes(targetItemId));
+    const owner = state.agents.find(
+      (candidate) => candidate.id !== agentId && candidate.inventory.includes(wantedItemId)
+    );
 
     if (!owner) {
       continue;
     }
 
     const giveItemId = [...agent.inventory].sort((left, right) => agent.valuations[left] - agent.valuations[right])[0];
-    const perceivedGain = agent.valuations[targetItemId] ?? 0;
+    const perceivedGain = agent.valuations[wantedItemId] ?? 0;
     const perceivedLoss = giveItemId ? agent.valuations[giveItemId] ?? 0 : 0;
-    const cashFromProposer = Math.max(0, Math.min(agent.budget, Math.round((perceivedGain - perceivedLoss) * 0.35)));
 
     return {
-      type: "propose_trade",
       agentId,
-      toAgentId: owner.id,
-      giveItemIds: giveItemId ? [giveItemId] : [],
-      requestItemIds: [targetItemId],
-      cashFromProposer,
-      message: "You know this helps your liquidity. Let's move quickly."
-    };
-  }
-
-  const rival = state.agents.find((candidate) => candidate.id !== agentId);
-  if (rival) {
-    return {
-      type: "whisper",
-      agentId,
-      toAgentId: rival.id,
-      content: "A larger offer is already on the table. Decide whether you want to beat it."
+      announce: `I am ready to move fast if someone values liquidity today.`,
+      whispers: [
+        {
+          toAgentId: owner.id,
+          content: `You may want to accept quickly before the market reprices ${wantedItemId}.`
+        }
+      ],
+      offer: {
+        toAgentId: owner.id,
+        giveItemIds: giveItemId ? [giveItemId] : [],
+        requestItemIds: [wantedItemId],
+        cashFromProposer: Math.max(0, Math.min(agent.budget, Math.round((perceivedGain - perceivedLoss) * 0.3))),
+        message: "I can close this now."
+      },
+      responses: [],
+      doneTrading: false,
+      reasoning: "Made a heuristic offer for a wishlist item."
     };
   }
 
   return {
-    type: "announce",
     agentId,
-    content: "The market is drifting. I'm open to creative offers."
+    whispers: [],
+    responses: [],
+    doneTrading: true,
+    reasoning: "No useful trade path detected."
   };
 }
 
-export function applyAction(state: MarketState, action: SimulationAction, trace: string): AppliedActionResult {
+export function applyTick(
+  state: MarketState,
+  plans: AgentTickPlan[],
+  traces: Array<{ agentId: string; trace: string }>
+): AppliedTickResult {
   const timestamp = new Date().toISOString();
   const nextState = structuredClone(state);
   const emittedEvents: MarketEvent[] = [];
+  const planByAgent = new Map(plans.map((plan) => [plan.agentId, normalizePlan(plan)]));
+  const openOfferIdsAtTickStart = new Set(
+    state.offers.filter((offer) => offer.status === "open").map((offer) => offer.id)
+  );
 
-  switch (action.type) {
-    case "announce":
+  emittedEvents.push({
+    id: randomUUID(),
+    round: state.round,
+    type: "tick",
+    visibility: "public",
+    content: `Tick ${state.tickCount + 1} started with ${state.agents.length} agent submissions.`,
+    createdAt: timestamp
+  });
+
+  nextState.doneAgentIds = state.agents
+    .filter((agent) => planByAgent.get(agent.id)?.doneTrading)
+    .map((agent) => agent.id);
+
+  for (const agent of state.agents) {
+    const plan = planByAgent.get(agent.id);
+
+    if (!plan) {
+      emittedEvents.push(createDecisionEvent(state.round, agent.id, "No plan submitted for this tick.", timestamp));
+      continue;
+    }
+
+    if (plan.announce) {
       emittedEvents.push({
         id: randomUUID(),
         round: state.round,
         type: "announce",
         visibility: "public",
-        actorAgentId: action.agentId,
-        content: `${action.agentId} announced: ${action.content}`,
+        actorAgentId: agent.id,
+        content: `${agent.id} announced: ${plan.announce}`,
         createdAt: timestamp
       });
-      break;
-    case "whisper":
+    }
+
+    const whispersByTarget = new Map<string, number>();
+    for (const whisper of plan.whispers) {
+      const targetAgent = findAgentById(state, whisper.toAgentId);
+
+      if (!targetAgent || whisper.toAgentId === agent.id) {
+        emittedEvents.push(
+          createDecisionEvent(state.round, agent.id, `Ignored invalid whisper target ${whisper.toAgentId}.`, timestamp)
+        );
+        continue;
+      }
+
+      const count = (whispersByTarget.get(whisper.toAgentId) ?? 0) + 1;
+      whispersByTarget.set(whisper.toAgentId, count);
+
+      if (count > MAX_WHISPERS_PER_TARGET_PER_TICK) {
+        emittedEvents.push(
+          createDecisionEvent(
+            state.round,
+            agent.id,
+            `Ignored whisper to ${whisper.toAgentId} because the per-target limit was exceeded.`,
+            timestamp
+          )
+        );
+        continue;
+      }
+
       emittedEvents.push({
         id: randomUUID(),
         round: state.round,
         type: "whisper",
         visibility: "private",
-        actorAgentId: action.agentId,
-        targetAgentId: action.toAgentId,
-        content: `${action.agentId} whispered to ${action.toAgentId}: ${action.content}`,
+        actorAgentId: agent.id,
+        targetAgentId: whisper.toAgentId,
+        content: `${agent.id} whispered to ${whisper.toAgentId}: ${whisper.content}`,
         createdAt: timestamp
       });
-      break;
-    case "propose_trade": {
-      const validation = validateOffer(state, action);
-
-      if (!validation.ok) {
-        emittedEvents.push(createDecisionEvent(state.round, action.agentId, `Offer blocked: ${validation.reason}`, timestamp));
-        break;
-      }
-
-      nextState.offers.unshift({
-        id: randomUUID(),
-        fromAgentId: action.agentId,
-        toAgentId: action.toAgentId,
-        giveItemIds: action.giveItemIds,
-        requestItemIds: action.requestItemIds,
-        cashFromProposer: action.cashFromProposer,
-        status: "open",
-        message: action.message,
-        createdAt: timestamp
-      });
-
-      emittedEvents.push({
-        id: randomUUID(),
-        round: state.round,
-        type: "offer",
-        visibility: "public",
-        actorAgentId: action.agentId,
-        targetAgentId: action.toAgentId,
-        content: `${action.agentId} offered ${action.giveItemIds.join(", ") || "nothing"} and $${action.cashFromProposer} to ${action.toAgentId} for ${action.requestItemIds.join(", ")}.`,
-        createdAt: timestamp
-      });
-      break;
     }
-    case "accept_trade": {
-      const offer = nextState.offers.find((candidate) => candidate.id === action.offerId);
 
-      if (!offer || offer.status !== "open" || offer.toAgentId !== action.agentId) {
-        emittedEvents.push(createDecisionEvent(state.round, action.agentId, `Acceptance blocked for ${action.offerId}.`, timestamp));
-        break;
+    if (plan.offer) {
+      const validation = validateNewOffer(state, agent.id, plan.offer);
+
+      if (!validation.ok) {
+        emittedEvents.push(createDecisionEvent(state.round, agent.id, `Offer blocked: ${validation.reason}`, timestamp));
+      } else {
+        const offer: TradeOffer = {
+          id: randomUUID(),
+          fromAgentId: agent.id,
+          toAgentId: plan.offer.toAgentId,
+          giveItemIds: [...plan.offer.giveItemIds],
+          requestItemIds: [...plan.offer.requestItemIds],
+          cashFromProposer: plan.offer.cashFromProposer,
+          status: "open",
+          message: plan.offer.message,
+          createdAt: timestamp
+        };
+
+        nextState.offers.unshift(offer);
+        emittedEvents.push({
+          id: randomUUID(),
+          round: state.round,
+          type: "offer",
+          visibility: "public",
+          actorAgentId: agent.id,
+          targetAgentId: plan.offer.toAgentId,
+          content: `${agent.id} offered ${offer.giveItemIds.join(", ") || "nothing"} and $${offer.cashFromProposer} to ${offer.toAgentId} for ${offer.requestItemIds.join(", ") || "nothing"}.`,
+          createdAt: timestamp
+        });
+      }
+    }
+  }
+
+  for (const agent of state.agents) {
+    const plan = planByAgent.get(agent.id);
+
+    if (!plan) {
+      continue;
+    }
+
+    const seenOfferIds = new Set<string>();
+
+    for (const response of plan.responses) {
+      if (seenOfferIds.has(response.offerId)) {
+        continue;
+      }
+      seenOfferIds.add(response.offerId);
+
+      const offer = nextState.offers.find((candidate) => candidate.id === response.offerId);
+
+      if (!offer || !openOfferIdsAtTickStart.has(response.offerId) || offer.status !== "open") {
+        emittedEvents.push(
+          createDecisionEvent(state.round, agent.id, `Response ignored for unavailable offer ${response.offerId}.`, timestamp)
+        );
+        continue;
       }
 
-      const validation = validateAccept(nextState, offer);
-      if (!validation.ok) {
+      if (offer.toAgentId !== agent.id) {
+        emittedEvents.push(
+          createDecisionEvent(state.round, agent.id, `Response ignored because ${response.offerId} is not addressed to ${agent.id}.`, timestamp)
+        );
+        continue;
+      }
+
+      offer.respondedAt = timestamp;
+
+      if (response.decision === "reject") {
         offer.status = "rejected";
-        emittedEvents.push(createDecisionEvent(state.round, action.agentId, `Acceptance failed: ${validation.reason}`, timestamp));
-        break;
+        emittedEvents.push(
+          createDecisionEvent(
+            state.round,
+            agent.id,
+            `${agent.id} rejected ${offer.fromAgentId}'s offer: ${response.reason || "No reason provided."}`,
+            timestamp
+          )
+        );
+        continue;
       }
 
-      settleTrade(nextState, offer);
       offer.status = "accepted";
-      emittedEvents.push({
-        id: randomUUID(),
-        round: state.round,
-        type: "trade",
-        visibility: "public",
-        actorAgentId: offer.fromAgentId,
-        targetAgentId: offer.toAgentId,
-        content: `${offer.toAgentId} accepted ${offer.fromAgentId}'s offer for ${offer.requestItemIds.join(", ")}.`,
-        createdAt: timestamp
-      });
-      break;
-    }
-    case "reject_trade": {
-      const offer = nextState.offers.find((candidate) => candidate.id === action.offerId);
-
-      if (!offer || offer.status !== "open" || offer.toAgentId !== action.agentId) {
-        emittedEvents.push(createDecisionEvent(state.round, action.agentId, `Rejection ignored for ${action.offerId}.`, timestamp));
-        break;
-      }
-
-      offer.status = "rejected";
       emittedEvents.push(
         createDecisionEvent(
           state.round,
-          action.agentId,
-          `${action.agentId} rejected ${offer.fromAgentId}'s offer: ${action.reason}`,
+          agent.id,
+          `${agent.id} accepted ${offer.fromAgentId}'s offer and queued it for settlement.`,
           timestamp
         )
       );
-      break;
     }
-    case "pass":
-      emittedEvents.push(createDecisionEvent(state.round, action.agentId, `${action.agentId} passed: ${action.reasoning}`, timestamp));
-      break;
   }
 
-  emittedEvents.push(createDecisionEvent(state.round, action.agentId, trace, timestamp));
-  nextState.events = [...emittedEvents.slice().reverse(), ...state.events].slice(0, 200);
-  nextState.tickCount = state.tickCount + 1;
-  nextState.doneAgentIds = computeDoneAgentIds(state, action);
+  const acceptedOffers = nextState.offers
+    .filter((offer) => offer.status === "accepted")
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 
-  const currentIndex = state.agents.findIndex((agent) => agent.id === state.turnAgentId);
-  const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % state.agents.length;
-  nextState.turnAgentId = state.agents[nextIndex]?.id ?? state.turnAgentId;
-  nextState.round = nextState.turnAgentId === state.agents[0]?.id ? state.round + 1 : state.round;
+  for (const offer of acceptedOffers) {
+    const validation = validateSettlement(nextState, offer);
+
+    if (!validation.ok) {
+      offer.status = "invalid";
+      emittedEvents.push(
+        createDecisionEvent(
+          state.round,
+          offer.fromAgentId,
+          `Settlement failed for offer ${offer.id}: ${validation.reason}`,
+          timestamp
+        )
+      );
+      continue;
+    }
+
+    settleTrade(nextState, offer);
+    offer.status = "settled";
+    offer.settledAt = timestamp;
+    emittedEvents.push({
+      id: randomUUID(),
+      round: state.round,
+      type: "trade",
+      visibility: "public",
+      actorAgentId: offer.fromAgentId,
+      targetAgentId: offer.toAgentId,
+      content: `${offer.fromAgentId} and ${offer.toAgentId} settled a trade for ${offer.requestItemIds.join(", ") || "cash-only consideration"}.`,
+      createdAt: timestamp
+    });
+  }
+
+  for (const trace of traces) {
+    emittedEvents.push(createDecisionEvent(state.round, trace.agentId, trace.trace, timestamp));
+  }
+
+  emittedEvents.push({
+    id: randomUUID(),
+    round: state.round,
+    type: "tick",
+    visibility: "public",
+    content: `Tick ${state.tickCount + 1} resolved. ${nextState.doneAgentIds.length} agents declared they were done trading.`,
+    createdAt: timestamp
+  });
+
+  nextState.tickCount = state.tickCount + 1;
+  nextState.round = state.round + 1;
+  nextState.turnAgentId = "all-agents";
+  nextState.events = [...emittedEvents.slice().reverse(), ...state.events].slice(0, 200);
 
   return {
     state: nextState,
@@ -389,38 +568,91 @@ export function completeSession(state: MarketState, reason: string, timestamp = 
   };
 }
 
-export function isAgentAction(value: unknown, agentId: string): value is SimulationAction {
+export function isAgentTickPlan(value: unknown, agentId: string): value is AgentTickPlan {
   if (!value || typeof value !== "object") {
     return false;
   }
 
-  const action = value as Record<string, unknown>;
-  if (action.agentId !== agentId || typeof action.type !== "string") {
+  const plan = value as Record<string, unknown>;
+
+  if (plan.agentId !== agentId || typeof plan.reasoning !== "string" || typeof plan.doneTrading !== "boolean") {
     return false;
   }
 
-  switch (action.type) {
-    case "announce":
-      return typeof action.content === "string";
-    case "whisper":
-      return typeof action.toAgentId === "string" && typeof action.content === "string";
-    case "propose_trade":
-      return (
-        typeof action.toAgentId === "string" &&
-        Array.isArray(action.giveItemIds) &&
-        Array.isArray(action.requestItemIds) &&
-        typeof action.cashFromProposer === "number" &&
-        typeof action.message === "string"
-      );
-    case "accept_trade":
-      return typeof action.offerId === "string";
-    case "reject_trade":
-      return typeof action.offerId === "string" && typeof action.reason === "string";
-    case "pass":
-      return typeof action.reasoning === "string";
-    default:
-      return false;
+  if (plan.announce !== undefined && typeof plan.announce !== "string") {
+    return false;
   }
+
+  if (!Array.isArray(plan.whispers) || !Array.isArray(plan.responses)) {
+    return false;
+  }
+
+  if (
+    !plan.whispers.every(
+      (whisper) =>
+        whisper &&
+        typeof whisper === "object" &&
+        typeof (whisper as WhisperIntent).toAgentId === "string" &&
+        typeof (whisper as WhisperIntent).content === "string"
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    !plan.responses.every(
+      (response) =>
+        response &&
+        typeof response === "object" &&
+        typeof (response as OfferResponseIntent).offerId === "string" &&
+        ((response as OfferResponseIntent).decision === "accept" ||
+          (response as OfferResponseIntent).decision === "reject") &&
+        typeof (response as OfferResponseIntent).reason === "string"
+    )
+  ) {
+    return false;
+  }
+
+  if (plan.offer === undefined || plan.offer === null) {
+    return true;
+  }
+
+  return (
+    typeof plan.offer === "object" &&
+    typeof (plan.offer as TradeOfferIntent).toAgentId === "string" &&
+    Array.isArray((plan.offer as TradeOfferIntent).giveItemIds) &&
+    Array.isArray((plan.offer as TradeOfferIntent).requestItemIds) &&
+    typeof (plan.offer as TradeOfferIntent).cashFromProposer === "number" &&
+    typeof (plan.offer as TradeOfferIntent).message === "string"
+  );
+}
+
+function normalizePlan(plan: AgentTickPlan): AgentTickPlan {
+  return {
+    ...plan,
+    announce: plan.announce?.trim() ? plan.announce.trim() : undefined,
+    whispers: plan.whispers
+      .map((whisper) => ({
+        toAgentId: whisper.toAgentId,
+        content: whisper.content.trim()
+      }))
+      .filter((whisper) => whisper.content.length > 0),
+    responses: plan.responses.map((response) => ({
+      offerId: response.offerId,
+      decision: response.decision,
+      reason: response.reason.trim()
+    })),
+    offer: plan.offer
+      ? {
+          toAgentId: plan.offer.toAgentId,
+          giveItemIds: [...plan.offer.giveItemIds],
+          requestItemIds: [...plan.offer.requestItemIds],
+          cashFromProposer: plan.offer.cashFromProposer,
+          message: plan.offer.message.trim()
+        }
+      : undefined,
+    reasoning: plan.reasoning.trim()
+  };
 }
 
 function createDecisionEvent(round: number, agentId: string, content: string, createdAt: string): MarketEvent {
@@ -435,41 +667,47 @@ function createDecisionEvent(round: number, agentId: string, content: string, cr
   };
 }
 
-function validateOffer(state: MarketState, action: Extract<SimulationAction, { type: "propose_trade" }>) {
-  const proposer = findAgentById(state, action.agentId);
-  const target = findAgentById(state, action.toAgentId);
+function validateNewOffer(state: MarketState, agentId: string, offer: TradeOfferIntent) {
+  const proposer = findAgentById(state, agentId);
+  const target = findAgentById(state, offer.toAgentId);
 
   if (!proposer || !target) {
     return { ok: false, reason: "Unknown proposer or target." };
   }
-  if (action.cashFromProposer < 0 || proposer.budget < action.cashFromProposer) {
+
+  if (agentId === offer.toAgentId) {
+    return { ok: false, reason: "Agents cannot offer trades to themselves." };
+  }
+
+  if (offer.cashFromProposer < 0 || proposer.budget < offer.cashFromProposer) {
     return { ok: false, reason: "Cash offer exceeds budget." };
   }
-  if (!action.giveItemIds.every((itemId) => proposer.inventory.includes(itemId))) {
+
+  if (!offer.giveItemIds.every((itemId) => proposer.inventory.includes(itemId))) {
     return { ok: false, reason: "Proposer tried to offer an item they do not own." };
-  }
-  if (!action.requestItemIds.every((itemId) => target.inventory.includes(itemId))) {
-    return { ok: false, reason: "Requested item is not owned by the target." };
   }
 
   return { ok: true };
 }
 
-function validateAccept(state: MarketState, offer: TradeOffer) {
+function validateSettlement(state: MarketState, offer: TradeOffer) {
   const proposer = findAgentById(state, offer.fromAgentId);
   const responder = findAgentById(state, offer.toAgentId);
 
   if (!proposer || !responder) {
     return { ok: false, reason: "One party is missing." };
   }
+
   if (!offer.giveItemIds.every((itemId) => proposer.inventory.includes(itemId))) {
     return { ok: false, reason: "Proposer no longer owns offered items." };
   }
+
   if (!offer.requestItemIds.every((itemId) => responder.inventory.includes(itemId))) {
     return { ok: false, reason: "Responder no longer owns requested items." };
   }
+
   if (proposer.budget < offer.cashFromProposer) {
-    return { ok: false, reason: "Proposer can no longer cover cash portion." };
+    return { ok: false, reason: "Proposer cannot cover the cash portion." };
   }
 
   return { ok: true };
@@ -493,12 +731,14 @@ function settleTrade(state: MarketState, offer: TradeOffer) {
 
 function evaluateOfferForTarget(state: MarketState, offer: TradeOffer) {
   const target = findAgentById(state, offer.toAgentId);
+
   if (!target) {
     return -Infinity;
   }
 
   const gainedValue = offer.giveItemIds.reduce((sum, itemId) => sum + scoreItem(target, itemId), 0);
   const lostValue = offer.requestItemIds.reduce((sum, itemId) => sum + scoreItem(target, itemId), 0);
+
   return gainedValue + offer.cashFromProposer - lostValue;
 }
 
@@ -510,12 +750,4 @@ function scoreItem(agent: AgentProfile, itemId: string) {
 
 function buildSessionName() {
   return `Session ${new Date().toISOString().replace("T", " ").slice(0, 19)}`;
-}
-
-function computeDoneAgentIds(state: MarketState, action: SimulationAction) {
-  if (action.type === "pass") {
-    return Array.from(new Set([...state.doneAgentIds, action.agentId]));
-  }
-
-  return [];
 }
