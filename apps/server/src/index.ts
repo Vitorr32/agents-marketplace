@@ -36,6 +36,16 @@ app.get("/api/sessions/:sessionId/replay", async (request, reply) => {
 
   return replay;
 });
+app.delete("/api/sessions/:sessionId", async (request, reply) => {
+  const deleted = await simulation.deleteSession((request.params as { sessionId: string }).sessionId);
+
+  if (!deleted) {
+    reply.code(404);
+    return { message: "Session not found." };
+  }
+
+  return { ok: true };
+});
 app.post("/api/simulation/reset", async () => simulation.reset());
 app.post("/api/simulation/step", async () => simulation.step());
 app.post("/api/simulation/toggle-run", async () => simulation.toggleRun());

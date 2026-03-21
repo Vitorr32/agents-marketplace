@@ -73,6 +73,20 @@ export class SimulationService {
     return this.repository.getReplay(sessionId);
   }
 
+  async deleteSession(sessionId: string) {
+    const deleted = this.repository.deleteSession(sessionId);
+
+    if (!deleted) {
+      return false;
+    }
+
+    if (this.state.sessionId === sessionId) {
+      await this.reset();
+    }
+
+    return true;
+  }
+
   async reset() {
     this.stopLoop();
     this.state = createSeedState();

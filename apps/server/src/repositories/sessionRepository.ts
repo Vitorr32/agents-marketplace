@@ -169,6 +169,16 @@ export class SessionRepository {
       events: eventRows.map((row) => JSON.parse(row.payload_json) as MarketEvent)
     };
   }
+
+  deleteSession(sessionId: string) {
+    const transaction = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM session_events WHERE session_id = ?").run(sessionId);
+      const result = this.db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
+      return result.changes > 0;
+    });
+
+    return transaction();
+  }
 }
 
 function toSessionSummary(row: SessionRow): SessionSummary {
