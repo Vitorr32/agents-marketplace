@@ -39,12 +39,36 @@ export type MarketEvent = {
 };
 
 export type MarketState = {
+  sessionId: string;
+  sessionName: string;
   round: number;
+  tickCount: number;
+  maxTicks: number;
   isRunning: boolean;
+  status: "paused" | "running" | "completed";
+  completionReason?: string;
   turnAgentId: string;
+  doneAgentIds: string[];
   items: Item[];
   agents: AgentProfile[];
   offers: TradeOffer[];
+  events: MarketEvent[];
+};
+
+export type SessionSummary = {
+  id: string;
+  name: string;
+  round: number;
+  tickCount: number;
+  maxTicks: number;
+  status: "paused" | "running" | "completed";
+  completionReason?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type SessionReplay = {
+  session: SessionSummary;
   events: MarketEvent[];
 };
 

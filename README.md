@@ -8,6 +8,7 @@ A local multi-agent trading sandbox where AI agents negotiate over scarce items,
 - `apps/server`: Fastify + Socket.IO simulation server
 - `packages/shared`: shared contracts
 - `packages/engine`: deterministic market engine and fallback agent logic
+- `apps/server/data/agents-marketplace.db`: local SQLite database created automatically by the server
 
 ## Local startup
 
@@ -27,6 +28,7 @@ That one command starts:
 
 - web app on `http://localhost:5173`
 - server on `http://localhost:3001`
+- SQLite persistence automatically inside `apps/server/data/agents-marketplace.db`
 
 ## Ollama
 
@@ -46,11 +48,21 @@ If Ollama is unavailable or returns malformed output, the server falls back to a
 - supports `announce`, `whisper`, `propose_trade`, `accept_trade`, `reject_trade`, and `pass`
 - uses a turn-based simulation loop
 - broadcasts live state over WebSockets to the UI
+- persists sessions and replayable event logs in local SQLite
+- ends a session at 1000 ticks or when every agent passes in sequence and the market goes inactive
+
+## Replay
+
+Each session is stored with:
+
+- the latest snapshot of market state
+- an append-only event log for replay
+
+The UI can browse saved sessions, and the backend exposes replay data through `/api/sessions/:sessionId/replay`.
 
 ## Next useful additions
 
-- persistent sessions with Postgres
 - richer utility functions and collection bonuses
 - hidden memory per agent
-- replayable transcripts
 - human-in-the-loop bidding
+- export/import of saved sessions

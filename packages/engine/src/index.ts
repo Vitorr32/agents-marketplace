@@ -10,6 +10,8 @@ import type {
 
 export type { AgentProfile, Item, MarketEvent, MarketState, SimulationAction, TradeOffer };
 
+const MAX_TICKS = 1000;
+
 const ITEMS: Item[] = [
   { id: "saffron", name: "Saffron", description: "Rare spice cache.", category: "luxury" },
   { id: "solar-lens", name: "Solar Lens", description: "Portable focusing array.", category: "tech" },
@@ -96,11 +98,22 @@ const SEED_AGENTS: AgentProfile[] = [
   }
 ];
 
-export function createSeedState(): MarketState {
+export type AppliedActionResult = {
+  state: MarketState;
+  emittedEvents: MarketEvent[];
+};
+
+export function createSeedState(sessionId = randomUUID(), sessionName = buildSessionName()): MarketState {
   return {
+    sessionId,
+    sessionName,
     round: 1,
+    tickCount: 0,
+    maxTicks: MAX_TICKS,
     isRunning: false,
+    status: "paused",
     turnAgentId: SEED_AGENTS[0].id,
+    doneAgentIds: [],
     items: ITEMS,
     agents: structuredClone(SEED_AGENTS),
     offers: [],
@@ -224,14 +237,14 @@ export function chooseFallbackAction(state: MarketState, agentId: string): Simul
   };
 }
 
-export function applyAction(state: MarketState, action: SimulationAction, trace: string) {
+export function applyAction(state: MarketState, action: SimulationAction, trace: string): AppliedActionResult {
   const timestamp = new Date().toISOString();
   const nextState = structuredClone(state);
-  const events = [...state.events];
+  const emittedEvents: MarketEvent[] = [];
 
   switch (action.type) {
     case "announce":
-      events.unshift({
+      emittedEvents.push({
         id: randomUUID(),
         round: state.round,
         type: "announce",
@@ -242,7 +255,7 @@ export function applyAction(state: MarketState, action: SimulationAction, trace:
       });
       break;
     case "whisper":
-      events.unshift({
+      emittedEvents.push({
         id: randomUUID(),
         round: state.round,
         type: "whisper",
@@ -257,7 +270,7 @@ export function applyAction(state: MarketState, action: SimulationAction, trace:
       const validation = validateOffer(state, action);
 
       if (!validation.ok) {
-        events.unshift(createDecisionEvent(state.round, action.agentId, `Offer blocked: ${validation.reason}`, timestamp));
+        emittedEvents.push(createDecisionEvent(state.round, action.agentId, `Offer blocked: ${validation.reason}`, timestamp));
         break;
       }
 
@@ -273,7 +286,7 @@ export function applyAction(state: MarketState, action: SimulationAction, trace:
         createdAt: timestamp
       });
 
-      events.unshift({
+      emittedEvents.push({
         id: randomUUID(),
         round: state.round,
         type: "offer",
@@ -289,20 +302,20 @@ export function applyAction(state: MarketState, action: SimulationAction, trace:
       const offer = nextState.offers.find((candidate) => candidate.id === action.offerId);
 
       if (!offer || offer.status !== "open" || offer.toAgentId !== action.agentId) {
-        events.unshift(createDecisionEvent(state.round, action.agentId, `Acceptance blocked for ${action.offerId}.`, timestamp));
+        emittedEvents.push(createDecisionEvent(state.round, action.agentId, `Acceptance blocked for ${action.offerId}.`, timestamp));
         break;
       }
 
       const validation = validateAccept(nextState, offer);
       if (!validation.ok) {
         offer.status = "rejected";
-        events.unshift(createDecisionEvent(state.round, action.agentId, `Acceptance failed: ${validation.reason}`, timestamp));
+        emittedEvents.push(createDecisionEvent(state.round, action.agentId, `Acceptance failed: ${validation.reason}`, timestamp));
         break;
       }
 
       settleTrade(nextState, offer);
       offer.status = "accepted";
-      events.unshift({
+      emittedEvents.push({
         id: randomUUID(),
         round: state.round,
         type: "trade",
@@ -318,12 +331,12 @@ export function applyAction(state: MarketState, action: SimulationAction, trace:
       const offer = nextState.offers.find((candidate) => candidate.id === action.offerId);
 
       if (!offer || offer.status !== "open" || offer.toAgentId !== action.agentId) {
-        events.unshift(createDecisionEvent(state.round, action.agentId, `Rejection ignored for ${action.offerId}.`, timestamp));
+        emittedEvents.push(createDecisionEvent(state.round, action.agentId, `Rejection ignored for ${action.offerId}.`, timestamp));
         break;
       }
 
       offer.status = "rejected";
-      events.unshift(
+      emittedEvents.push(
         createDecisionEvent(
           state.round,
           action.agentId,
@@ -334,19 +347,46 @@ export function applyAction(state: MarketState, action: SimulationAction, trace:
       break;
     }
     case "pass":
-      events.unshift(createDecisionEvent(state.round, action.agentId, `${action.agentId} passed: ${action.reasoning}`, timestamp));
+      emittedEvents.push(createDecisionEvent(state.round, action.agentId, `${action.agentId} passed: ${action.reasoning}`, timestamp));
       break;
   }
 
-  events.unshift(createDecisionEvent(state.round, action.agentId, trace, timestamp));
-  nextState.events = events.slice(0, 200);
+  emittedEvents.push(createDecisionEvent(state.round, action.agentId, trace, timestamp));
+  nextState.events = [...emittedEvents.slice().reverse(), ...state.events].slice(0, 200);
+  nextState.tickCount = state.tickCount + 1;
+  nextState.doneAgentIds = computeDoneAgentIds(state, action);
 
   const currentIndex = state.agents.findIndex((agent) => agent.id === state.turnAgentId);
   const nextIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % state.agents.length;
   nextState.turnAgentId = state.agents[nextIndex]?.id ?? state.turnAgentId;
   nextState.round = nextState.turnAgentId === state.agents[0]?.id ? state.round + 1 : state.round;
 
-  return nextState;
+  return {
+    state: nextState,
+    emittedEvents
+  };
+}
+
+export function completeSession(state: MarketState, reason: string, timestamp = new Date().toISOString()) {
+  const event: MarketEvent = {
+    id: randomUUID(),
+    round: state.round,
+    type: "system",
+    visibility: "public",
+    content: reason,
+    createdAt: timestamp
+  };
+
+  return {
+    state: {
+      ...state,
+      isRunning: false,
+      status: "completed" as const,
+      completionReason: reason,
+      events: [event, ...state.events].slice(0, 200)
+    },
+    event
+  };
 }
 
 export function isAgentAction(value: unknown, agentId: string): value is SimulationAction {
@@ -466,4 +506,16 @@ function scoreItem(agent: AgentProfile, itemId: string) {
   const base = agent.valuations[itemId] ?? 0;
   const wishlistIndex = agent.wishlist.indexOf(itemId);
   return base + (wishlistIndex === -1 ? 0 : (agent.wishlist.length - wishlistIndex) * 8);
+}
+
+function buildSessionName() {
+  return `Session ${new Date().toISOString().replace("T", " ").slice(0, 19)}`;
+}
+
+function computeDoneAgentIds(state: MarketState, action: SimulationAction) {
+  if (action.type === "pass") {
+    return Array.from(new Set([...state.doneAgentIds, action.agentId]));
+  }
+
+  return [];
 }

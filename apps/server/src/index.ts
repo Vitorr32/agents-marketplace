@@ -19,10 +19,22 @@ await app.register(cors, {
 app.get("/api/health", async () => ({
   ok: true,
   runtimeMode: config.agentRuntimeMode,
-  model: config.ollamaModel
+  model: config.ollamaModel,
+  databasePath: config.databasePath
 }));
 
 app.get("/api/simulation", async () => simulation.getState());
+app.get("/api/sessions", async () => simulation.listSessions());
+app.get("/api/sessions/:sessionId/replay", async (request, reply) => {
+  const replay = simulation.getReplay((request.params as { sessionId: string }).sessionId);
+
+  if (!replay) {
+    reply.code(404);
+    return { message: "Session not found." };
+  }
+
+  return replay;
+});
 app.post("/api/simulation/reset", async () => simulation.reset());
 app.post("/api/simulation/step", async () => simulation.step());
 app.post("/api/simulation/toggle-run", async () => simulation.toggleRun());

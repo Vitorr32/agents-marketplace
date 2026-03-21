@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { io } from "socket.io-client";
-import type { MarketState } from "@agents-marketplace/shared";
+import type { MarketState, SessionReplay, SessionSummary } from "@agents-marketplace/shared";
 
 type SimulationUpdate = {
   state: MarketState;
@@ -12,14 +12,20 @@ const socket = io({
 
 export function App() {
   const [state, setState] = useState<MarketState | null>(null);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [selectedReplay, setSelectedReplay] = useState<SessionReplay | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    void loadInitialState();
+    void Promise.all([loadInitialState(), loadSessions()]);
 
     socket.connect();
     socket.on("simulation:update", (update: SimulationUpdate) => {
       setState(update.state);
+
+      if (update.state.tickCount % 5 === 0 || update.state.status === "completed") {
+        void loadSessions();
+      }
     });
 
     return () => {
@@ -32,6 +38,24 @@ export function App() {
     const response = await fetch("/api/simulation");
     const snapshot = (await response.json()) as MarketState;
     setState(snapshot);
+    await loadReplay(snapshot.sessionId);
+  }
+
+  async function loadSessions() {
+    const response = await fetch("/api/sessions");
+    const payload = (await response.json()) as SessionSummary[];
+    setSessions(payload);
+  }
+
+  async function loadReplay(sessionId: string) {
+    const response = await fetch(`/api/sessions/${sessionId}/replay`);
+
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = (await response.json()) as SessionReplay;
+    setSelectedReplay(payload);
   }
 
   async function post(path: string) {
@@ -40,6 +64,8 @@ export function App() {
       const response = await fetch(path, { method: "POST" });
       const snapshot = (await response.json()) as MarketState;
       setState(snapshot);
+      await loadSessions();
+      await loadReplay(snapshot.sessionId);
     } finally {
       setBusy(false);
     }
@@ -66,25 +92,33 @@ export function App() {
             <strong>{state.round}</strong>
           </div>
           <div className="stat">
+            <span>Ticks</span>
+            <strong>
+              {state.tickCount}/{state.maxTicks}
+            </strong>
+          </div>
+          <div className="stat">
             <span>Turn</span>
             <strong>{state.turnAgentId}</strong>
           </div>
           <div className="stat">
-            <span>Mode</span>
-            <strong>{state.isRunning ? "Running" : "Paused"}</strong>
+            <span>Status</span>
+            <strong>{state.status}</strong>
           </div>
         </div>
       </section>
 
+      {state.completionReason ? <p className="banner">{state.completionReason}</p> : null}
+
       <section className="controls">
-        <button disabled={busy} onClick={() => void post("/api/simulation/step")}>
+        <button disabled={busy || state.status === "completed"} onClick={() => void post("/api/simulation/step")}>
           Step
         </button>
-        <button disabled={busy} onClick={() => void post("/api/simulation/toggle-run")}>
+        <button disabled={busy || state.status === "completed"} onClick={() => void post("/api/simulation/toggle-run")}>
           {state.isRunning ? "Pause" : "Run"}
         </button>
         <button disabled={busy} onClick={() => void post("/api/simulation/reset")}>
-          Reset
+          New Session
         </button>
       </section>
 
@@ -92,7 +126,9 @@ export function App() {
         <article className="panel">
           <div className="panel-head">
             <h2>Agents</h2>
-            <span>{state.agents.length} active negotiators</span>
+            <span>
+              {state.agents.length} active, {state.doneAgentIds.length} marked done
+            </span>
           </div>
 
           <div className="agent-list">
@@ -125,7 +161,7 @@ export function App() {
               <div className="offer-card" key={offer.id}>
                 <div className="agent-row">
                   <strong>
-                    {offer.fromAgentId} → {offer.toAgentId}
+                    {offer.fromAgentId} -&gt; {offer.toAgentId}
                   </strong>
                   <span className={`badge badge-${offer.status}`}>{offer.status}</span>
                 </div>
@@ -143,7 +179,7 @@ export function App() {
         <article className="panel">
           <div className="panel-head">
             <h2>Market Feed</h2>
-            <span>{state.events.length} events</span>
+            <span>{state.events.length} live events</span>
           </div>
 
           <div className="feed">
@@ -157,6 +193,69 @@ export function App() {
               </div>
             ))}
           </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-head">
+            <h2>Saved Sessions</h2>
+            <span>{sessions.length} stored</span>
+          </div>
+
+          <div className="feed">
+            {sessions.map((session) => (
+              <button
+                className={`session-card ${selectedReplay?.session.id === session.id ? "session-card-active" : ""}`}
+                key={session.id}
+                onClick={() => void loadReplay(session.id)}
+                type="button"
+              >
+                <div className="agent-row">
+                  <strong>{session.name}</strong>
+                  <span className={`badge badge-${session.status}`}>{session.status}</span>
+                </div>
+                <div className="meta">
+                  <span>
+                    Ticks: {session.tickCount}/{session.maxTicks}
+                  </span>
+                  <span>Round: {session.round}</span>
+                </div>
+              </button>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel replay-panel">
+          <div className="panel-head">
+            <h2>Replay Log</h2>
+            <span>{selectedReplay?.events.length ?? 0} persisted events</span>
+          </div>
+
+          {selectedReplay ? (
+            <div className="feed">
+              <div className="feed-item">
+                <div className="agent-row">
+                  <strong>{selectedReplay.session.name}</strong>
+                  <span>{selectedReplay.session.status}</span>
+                </div>
+                <p>
+                  {selectedReplay.session.tickCount}/{selectedReplay.session.maxTicks} ticks
+                </p>
+                {selectedReplay.session.completionReason ? <p>{selectedReplay.session.completionReason}</p> : null}
+              </div>
+
+              {selectedReplay.events.map((event) => (
+                <div className="feed-item" key={event.id}>
+                  <div className="agent-row">
+                    <strong>{event.type}</strong>
+                    <span>{event.createdAt}</span>
+                  </div>
+                  <p>{event.content}</p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="empty">Select a stored session to inspect its replay log.</p>
+          )}
         </article>
       </section>
     </main>

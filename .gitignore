@@ -199,6 +199,14 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+data/*.db
+data/*.db-journal
+data/*.db-shm
+data/*.db-wal
+apps/server/data/*.db
+apps/server/data/*.db-journal
+apps/server/data/*.db-shm
+apps/server/data/*.db-wal
 
 # Ruff stuff:
 .ruff_cache/
