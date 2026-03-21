@@ -1,0 +1,164 @@
+import { useEffect, useState } from "react";
+import { io } from "socket.io-client";
+import type { MarketState } from "@agents-marketplace/shared";
+
+type SimulationUpdate = {
+  state: MarketState;
+};
+
+const socket = io({
+  autoConnect: false
+});
+
+export function App() {
+  const [state, setState] = useState<MarketState | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    void loadInitialState();
+
+    socket.connect();
+    socket.on("simulation:update", (update: SimulationUpdate) => {
+      setState(update.state);
+    });
+
+    return () => {
+      socket.off("simulation:update");
+      socket.disconnect();
+    };
+  }, []);
+
+  async function loadInitialState() {
+    const response = await fetch("/api/simulation");
+    const snapshot = (await response.json()) as MarketState;
+    setState(snapshot);
+  }
+
+  async function post(path: string) {
+    setBusy(true);
+    try {
+      const response = await fetch(path, { method: "POST" });
+      const snapshot = (await response.json()) as MarketState;
+      setState(snapshot);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!state) {
+    return <main className="shell">Loading simulation...</main>;
+  }
+
+  return (
+    <main className="shell">
+      <section className="hero">
+        <div>
+          <p className="eyebrow">Multi-agent barter sandbox</p>
+          <h1>Agents Marketplace</h1>
+          <p className="lede">
+            Agents negotiate, bluff, whisper, and trade under deterministic market rules.
+          </p>
+        </div>
+
+        <div className="hero-panel">
+          <div className="stat">
+            <span>Round</span>
+            <strong>{state.round}</strong>
+          </div>
+          <div className="stat">
+            <span>Turn</span>
+            <strong>{state.turnAgentId}</strong>
+          </div>
+          <div className="stat">
+            <span>Mode</span>
+            <strong>{state.isRunning ? "Running" : "Paused"}</strong>
+          </div>
+        </div>
+      </section>
+
+      <section className="controls">
+        <button disabled={busy} onClick={() => void post("/api/simulation/step")}>
+          Step
+        </button>
+        <button disabled={busy} onClick={() => void post("/api/simulation/toggle-run")}>
+          {state.isRunning ? "Pause" : "Run"}
+        </button>
+        <button disabled={busy} onClick={() => void post("/api/simulation/reset")}>
+          Reset
+        </button>
+      </section>
+
+      <section className="grid">
+        <article className="panel">
+          <div className="panel-head">
+            <h2>Agents</h2>
+            <span>{state.agents.length} active negotiators</span>
+          </div>
+
+          <div className="agent-list">
+            {state.agents.map((agent) => (
+              <div className="agent-card" key={agent.id}>
+                <div className="agent-row">
+                  <h3>{agent.name}</h3>
+                  <span className="badge">${agent.budget}</span>
+                </div>
+                <p>{agent.persona}</p>
+                <div className="meta">
+                  <span>Inventory: {agent.inventory.length}</span>
+                  <span>Wishlist: {agent.wishlist.slice(0, 2).join(", ")}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-head">
+            <h2>Open Offers</h2>
+            <span>{state.offers.filter((offer) => offer.status === "open").length} live</span>
+          </div>
+
+          <div className="offer-list">
+            {state.offers.length === 0 && <p className="empty">No trade offers yet.</p>}
+
+            {state.offers.map((offer) => (
+              <div className="offer-card" key={offer.id}>
+                <div className="agent-row">
+                  <strong>
+                    {offer.fromAgentId} → {offer.toAgentId}
+                  </strong>
+                  <span className={`badge badge-${offer.status}`}>{offer.status}</span>
+                </div>
+                <p>{offer.message}</p>
+                <div className="meta">
+                  <span>Gives: {offer.giveItemIds.join(", ") || "nothing"}</span>
+                  <span>Wants: {offer.requestItemIds.join(", ") || "nothing"}</span>
+                  <span>Cash: ${offer.cashFromProposer}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-head">
+            <h2>Market Feed</h2>
+            <span>{state.events.length} events</span>
+          </div>
+
+          <div className="feed">
+            {state.events.map((event) => (
+              <div className="feed-item" key={event.id}>
+                <div className="agent-row">
+                  <strong>{event.type}</strong>
+                  <span>R{event.round}</span>
+                </div>
+                <p>{event.content}</p>
+              </div>
+            ))}
+          </div>
+        </article>
+      </section>
+    </main>
+  );
+}
