@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { io } from "socket.io-client";
 import {
   Activity, Archive, ArrowLeftRight, BookOpen, Check, ChevronRight,
@@ -118,7 +118,7 @@ function actionMeta(type: string | null): { label: string; color: string; icon: 
     case "counter":
       return { label: "Counter-offer", color: "text-amber-300", icon: <RotateCcw size={11} /> };
     case "tool":
-      return { label: "Querying history", color: "text-purple-300", icon: <Search size={11} /> };
+      return { label: "Using tool", color: "text-purple-300", icon: <Search size={11} /> };
     default:
       return { label: type ?? "", color: "text-slate-400", icon: null };
   }
@@ -129,6 +129,7 @@ function EventTypeIcon({ type }: { type: string }) {
   switch (type) {
     case "offer":     return <ArrowLeftRight size={sz} className="shrink-0 text-sky-400" />;
     case "trade":     return <Check          size={sz} className="shrink-0 text-green-400" />;
+    case "order":     return <Send           size={sz} className="shrink-0 text-amber-400" />;
     case "decision":  return <MessageSquare  size={sz} className="shrink-0 text-slate-500" />;
     case "tick":      return <Clock          size={sz} className="shrink-0 text-slate-600" />;
     default:          return <CircleDot      size={sz} className="shrink-0 text-slate-600" />;
@@ -453,6 +454,12 @@ export function App() {
                   {state.agents.map((agent) => {
                     const inventory = agent.inventory.map((id) => itemName(state.items, id));
                     const wishlist = agent.wishlist.map((id) => itemName(state.items, id));
+                    const initial = state.initialAgents?.find((a) => a.id === agent.id);
+                    const currentUtility = agent.inventory.reduce((s, id) => s + (agent.valuations[id] ?? 0), 0) + agent.budget;
+                    const startUtility = initial
+                      ? initial.inventory.reduce((s, id) => s + (initial.valuations[id] ?? 0), 0) + initial.budget
+                      : currentUtility;
+                    const utilityDelta = currentUtility - startUtility;
                     return (
                       <div className={CARD} key={agent.id}>
                         <div className="flex justify-between items-start gap-2 mb-1">
@@ -475,6 +482,53 @@ export function App() {
                             </div>
                           ))}
                         </div>
+
+                        {/* Utility bar */}
+                        <div className="mt-2 flex items-center gap-2 text-[0.7rem]">
+                          <span className="text-slate-500 font-semibold uppercase text-[0.6rem] tracking-wider">Utility</span>
+                          <span className="text-slate-300 font-mono">${currentUtility}</span>
+                          {utilityDelta !== 0 && (
+                            <span className={utilityDelta > 0 ? "text-green-400 font-mono" : "text-red-400 font-mono"}>
+                              {utilityDelta > 0 ? "+" : ""}{utilityDelta}
+                            </span>
+                          )}
+                          {utilityDelta === 0 && <span className="text-slate-600 font-mono">+0</span>}
+                        </div>
+
+                        {/* Expandable details */}
+                        <details className="group mt-2">
+                          <summary className="list-none flex items-center gap-1 text-[0.7rem] text-slate-600 cursor-pointer hover:text-slate-400 select-none">
+                            <ChevronRight size={11} className="transition-transform group-open:rotate-90" />
+                            Valuations & Details
+                          </summary>
+                          <div className="mt-2 flex flex-col gap-1">
+                            <div className="grid grid-cols-[1fr_auto_auto] gap-x-3 gap-y-0.5 text-[0.68rem]">
+                              <span className="text-slate-500 font-semibold uppercase text-[0.58rem] tracking-wider">Item</span>
+                              <span className="text-slate-500 font-semibold uppercase text-[0.58rem] tracking-wider text-right">Value</span>
+                              <span className="text-slate-500 font-semibold uppercase text-[0.58rem] tracking-wider text-right">Status</span>
+                              {state.items.map((item) => {
+                                const val = agent.valuations[item.id] ?? 0;
+                                const owns = agent.inventory.includes(item.id);
+                                const wants = agent.wishlist.includes(item.id);
+                                const status = owns ? "held" : wants ? "wanted" : "—";
+                                const statusColor = owns ? "text-green-400" : wants ? "text-amber-400" : "text-slate-600";
+                                return (
+                                  <React.Fragment key={item.id}>
+                                    <span className="text-slate-300">{item.name}</span>
+                                    <span className="text-slate-300 font-mono text-right">${val}</span>
+                                    <span className={`${statusColor} text-right`}>{status}</span>
+                                  </React.Fragment>
+                                );
+                              })}
+                            </div>
+                            {initial && (
+                              <div className="mt-2 text-[0.65rem] text-slate-500 flex flex-col gap-0.5">
+                                <span>Start: {initial.inventory.map((id) => itemName(state.items, id)).join(", ")} + ${initial.budget} = ${startUtility}</span>
+                                <span>Now: {inventory.join(", ") || "empty"} + ${agent.budget} = ${currentUtility}</span>
+                              </div>
+                            )}
+                          </div>
+                        </details>
                       </div>
                     );
                   })}

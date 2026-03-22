@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyBaseLogger } from "fastify";
 import type { Server as SocketServer } from "socket.io";
 import { completeSession, createSeedState, findAgentById, getActiveAgentIds, type MarketEvent, type MarketState } from "@agents-marketplace/engine";
-import type { SessionReplay, SessionSummary, TradeOffer } from "@agents-marketplace/shared";
+import type { MarketOrder, SessionReplay, SessionSummary, TradeOffer } from "@agents-marketplace/shared";
 import { config } from "../config.js";
 import { createDatabase } from "../db/database.js";
 import { SessionRepository } from "../repositories/sessionRepository.js";
@@ -344,6 +344,28 @@ export class SimulationService {
 
       pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, result.trace));
 
+      for (const order of result.postedOrders) {
+        const marketOrder: MarketOrder = {
+          id: randomUUID(),
+          agentId,
+          type: order.type,
+          itemId: order.itemId,
+          price: order.price,
+          status: "open",
+          createdAt: new Date().toISOString()
+        };
+        workingState.orders.push(marketOrder);
+        pushEvent(workingState, emittedEvents, {
+          id: randomUUID(),
+          round: workingState.round,
+          type: "order",
+          visibility: "public",
+          actorAgentId: agentId,
+          content: `${agentId} posted a ${order.type} order: ${order.itemId} at $${order.price}.`,
+          createdAt: new Date().toISOString()
+        });
+      }
+
       if (result.kind !== "offer") {
         continue;
       }
@@ -523,6 +545,10 @@ function validateTradeFromProposerPerspective(
 
   if (!proposal.giveItemIds.every((itemId) => proposer.inventory.includes(itemId))) {
     return { ok: false, reason: "Proposer does not own all offered items." };
+  }
+
+  if (!proposal.requestItemIds.every((itemId) => target.inventory.includes(itemId))) {
+    return { ok: false, reason: "Target does not currently own the requested items." };
   }
 
   return { ok: true };

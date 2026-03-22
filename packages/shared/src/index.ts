@@ -32,10 +32,22 @@ export type TradeOffer = {
   inResponseToOfferId?: string;
 };
 
+export type MarketOrderStatus = "open" | "filled" | "cancelled";
+
+export type MarketOrder = {
+  id: string;
+  agentId: string;
+  type: "buy" | "sell";
+  itemId: string;
+  price: number;
+  status: MarketOrderStatus;
+  createdAt: string;
+};
+
 export type MarketEvent = {
   id: string;
   round: number;
-  type: "system" | "tick" | "announce" | "whisper" | "offer" | "trade" | "decision";
+  type: "system" | "tick" | "announce" | "whisper" | "offer" | "trade" | "decision" | "order";
   visibility: "public" | "private";
   actorAgentId?: string;
   targetAgentId?: string;
@@ -85,7 +97,9 @@ export type MarketState = {
   doneAgentIds: string[];
   items: Item[];
   agents: AgentProfile[];
+  initialAgents?: AgentProfile[];
   offers: TradeOffer[];
+  orders: MarketOrder[];
   events: MarketEvent[];
 };
 

@@ -2,6 +2,10 @@
     "chat.tools.terminal.autoApprove": {
         "Set-Content": true,
         "npx tsc": true,
-        "npm install": true
+        "npm install": true,
+        "/^python C:\\\\Users\\\\vitor\\\\write_runtime\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

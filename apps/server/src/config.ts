@@ -6,5 +6,6 @@ export const config = {
   ollamaBaseUrl: process.env.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434",
   ollamaModel: process.env.OLLAMA_MODEL ?? "llama3.2",
   agentRuntimeMode: process.env.AGENT_RUNTIME_MODE ?? "ollama",
+  agentToolBudget: Number(process.env.AGENT_TOOL_BUDGET ?? 5),
   stepIntervalMs: Number(process.env.STEP_INTERVAL_MS ?? 2500)
 } as const;

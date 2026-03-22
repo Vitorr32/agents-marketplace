@@ -4,6 +4,7 @@ import type {
   AgentTickPlan,
   Item,
   MarketEvent,
+  MarketOrder,
   MarketState,
   OfferResponseIntent,
   TradeOffer,
@@ -137,6 +138,7 @@ export type AgentVisibleState = {
   openOffers: TradeOffer[];
   incomingOffers: TradeOffer[];
   outgoingOffers: TradeOffer[];
+  publicOrders: MarketOrder[];
   publicAnnouncements: MarketEvent[];
   privateWhispers: MarketEvent[];
   publicTradeEvents: MarketEvent[];
@@ -165,7 +167,9 @@ export function createSeedState(sessionId = randomUUID(), sessionName = buildSes
     doneAgentIds: [],
     items: ITEMS,
     agents: structuredClone(SEED_AGENTS),
+    initialAgents: structuredClone(SEED_AGENTS),
     offers: [],
+    orders: [],
     events: [
       {
         id: randomUUID(),
@@ -212,12 +216,13 @@ export function computeVisibleStateForAgent(state: MarketState, agentId: string)
       id: agent.id,
       name: agent.name,
       persona: agent.persona,
-      doneTrading: state.doneAgentIds.includes(agent.id)
+      doneTrading: state.doneAgentIds.includes(agent.id),
     })),
     items: state.items,
     openOffers: state.offers.filter((offer) => offer.status === "open"),
     incomingOffers: state.offers.filter((offer) => offer.status === "open" && offer.toAgentId === agentId),
     outgoingOffers: state.offers.filter((offer) => offer.status === "open" && offer.fromAgentId === agentId),
+    publicOrders: state.orders.filter((o) => o.status === "open"),
     publicAnnouncements: recentEvents.filter((event) => event.type === "announce").slice(0, 40),
     privateWhispers: recentEvents
       .filter(
