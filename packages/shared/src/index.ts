@@ -29,6 +29,7 @@ export type TradeOffer = {
   createdAt: string;
   respondedAt?: string;
   settledAt?: string;
+  inResponseToOfferId?: string;
 };
 
 export type MarketEvent = {
