@@ -1,5 +1,5 @@
 import { computeVisibleStateForAgent, findAgentById, type AgentVisibleState, type MarketState } from "@agents-marketplace/engine";
-import type { MarketOrder } from "@agents-marketplace/shared";
+import type { MarketOrder, TradeOffer } from "@agents-marketplace/shared";
 
 type RuntimeConfig = {
   agentRuntimeMode: string;
@@ -44,15 +44,6 @@ type OutgoingOfferSummary = {
   message: string;
 };
 
-type IncomingOfferContext = {
-  offerId: string;
-  fromAgentId: string;
-  giveItemIds: string[];
-  requestItemIds: string[];
-  cashFromProposer: number;
-  message: string;
-  guidance: OfferGuidance;
-};
 
 type OfferGuidance = {
   canAcceptNow: boolean;
@@ -65,12 +56,23 @@ type OfferGuidance = {
   blockers: string[];
 };
 
+type IncomingOfferSummary = {
+  offerId: string;
+  fromAgentId: string;
+  giveItemIds: string[];
+  requestItemIds: string[];
+  cashFromProposer: number;
+  message: string;
+  guidance: OfferGuidance;
+};
+
 type CompactContext = {
   self: SelfContext | null;
   otherAgents: OtherAgentContext[];
   items: ItemContext[];
   publicOrders: MarketOrder[];
   myPendingOffers: OutgoingOfferSummary[];
+  incomingOffers: IncomingOfferSummary[];
   recentTrades: string[];
 };
 
@@ -79,22 +81,11 @@ type ToolRequest =
   | { tool: "check_buy_orders"; itemId?: string }
   | { tool: "check_price_history"; itemId: string }
   | { tool: "post_sell_order"; itemId: string; price: number }
-  | { tool: "post_buy_order"; itemId: string; price: number };
+  | { tool: "post_buy_order"; itemId: string; price: number }
+  | { tool: "make_offer"; targetAgentId: string; giveItemIds: string[]; requestItemIds: string[]; cashFromProposer: number; message: string }
+  | { tool: "respond_to_offer"; offerId: string; decision: "accept" | "reject" | "counter"; reason?: string; giveItemIds?: string[]; requestItemIds?: string[]; cashFromProposer?: number; message?: string }
+  | { tool: "pass" };
 
-type PromptOptions = {
-  callbacks?: StreamCallbacks;
-  systemPrompt?: string;
-  temperature?: number;
-  format?: "json" | Record<string, unknown>;
-};
-
-type MakeOfferPayload = {
-  targetAgentId: string;
-  giveItemIds: string[];
-  requestItemIds: string[];
-  cashFromProposer: number;
-  message: string;
-};
 
 type CounterOfferPayload = {
   giveItemIds: string[];
@@ -105,34 +96,25 @@ type CounterOfferPayload = {
 
 export type PostedOrder = { type: "buy" | "sell"; itemId: string; price: number };
 
-export type ActiveActionResult =
-  | { kind: "pass"; trace: string; postedOrders: PostedOrder[] }
-  | {
-      kind: "offer";
-      offer: {
-        targetAgentId: string;
-        giveItemIds: string[];
-        requestItemIds: string[];
-        cashFromProposer: number;
-        message: string;
-      };
-      trace: string;
-      postedOrders: PostedOrder[];
-    };
+export type OfferAction = {
+  targetAgentId: string;
+  giveItemIds: string[];
+  requestItemIds: string[];
+  cashFromProposer: number;
+  message: string;
+};
 
-export type OfferResponseResult =
-  | { kind: "accept"; trace: string }
-  | { kind: "reject"; reason: string; trace: string }
-  | {
-      kind: "counter";
-      counter: {
-        giveItemIds: string[];
-        requestItemIds: string[];
-        cashFromProposer: number;
-        message: string;
-      };
-      trace: string;
-    };
+export type OfferResponseAction =
+  | { offerId: string; kind: "accept" }
+  | { offerId: string; kind: "reject"; reason: string }
+  | { offerId: string; kind: "counter"; counter: CounterOfferPayload };
+
+export type ActiveActionResult = {
+  trace: string;
+  postedOrders: PostedOrder[];
+  offers: OfferAction[];
+  offerResponses: OfferResponseAction[];
+};
 
 export class AgentRuntime {
   constructor(private readonly runtimeConfig: RuntimeConfig) {}
@@ -161,207 +143,129 @@ export class AgentRuntime {
 
   async generateActiveAction(state: MarketState, agentId: string, callbacks?: StreamCallbacks): Promise<ActiveActionResult> {
     if (this.runtimeConfig.agentRuntimeMode !== "ollama") {
-      return { kind: "pass", trace: `Active action skipped because runtime mode is ${this.runtimeConfig.agentRuntimeMode}.`, postedOrders: [] };
+      return { trace: `Active action skipped because runtime mode is ${this.runtimeConfig.agentRuntimeMode}.`, postedOrders: [], offers: [], offerResponses: [] };
     }
 
     const agent = findAgentById(state, agentId);
     if (!agent) {
-      return { kind: "pass", trace: "Agent missing from state.", postedOrders: [] };
+      return { trace: "Agent missing from state.", postedOrders: [], offers: [], offerResponses: [] };
     }
 
     const visibleState = computeVisibleStateForAgent(state, agentId);
     const compact = buildCompactContext(visibleState);
 
     try {
-      const { response, postedOrders } = await this.runToolChain(agentId, compact, callbacks);
-      const base = await this.normalizeActiveAction(agentId, compact, response);
-      if (base.kind === "offer") {
-        return { kind: "offer" as const, offer: base.offer, trace: base.trace, postedOrders };
-      }
-      return { kind: "pass" as const, trace: base.trace, postedOrders };
+      return await this.runToolChain(agentId, compact, callbacks);
     } catch (error) {
       callbacks?.onError?.(toMessage(error));
-      return { kind: "pass", trace: `Active action failed: ${toMessage(error)}`, postedOrders: [] };
-    }
-  }
-
-  async generateOfferResponse(
-    state: MarketState,
-    agentId: string,
-    offer: {
-      offerId: string;
-      fromAgentId: string;
-      giveItemIds: string[];
-      requestItemIds: string[];
-      cashFromProposer: number;
-      message: string;
-    },
-    callbacks?: StreamCallbacks
-  ): Promise<OfferResponseResult> {
-    if (this.runtimeConfig.agentRuntimeMode !== "ollama") {
-      return {
-        kind: "reject",
-        reason: `Offer response skipped because runtime mode is ${this.runtimeConfig.agentRuntimeMode}.`,
-        trace: `Offer response skipped because runtime mode is ${this.runtimeConfig.agentRuntimeMode}.`
-      };
-    }
-
-    const visibleState = computeVisibleStateForAgent(state, agentId);
-    const compact = buildCompactContext(visibleState);
-    const guidance = buildOfferGuidance(compact, offer);
-    const incomingOffer: IncomingOfferContext = { ...offer, guidance };
-
-    try {
-      const response = await this.completePrompt(
-        buildOfferResponsePrompt(agentId, compact, incomingOffer),
-        {
-          callbacks,
-          format: buildOfferResponseActionSchema(),
-          temperature: 0.1
-        }
-      );
-
-      return this.normalizeOfferResponse(agentId, compact, response);
-    } catch (error) {
-      callbacks?.onError?.(toMessage(error));
-      return {
-        kind: "reject",
-        reason: `Offer response failed: ${toMessage(error)}`,
-        trace: `Offer response failed: ${toMessage(error)}`
-      };
+      return { trace: `Active action failed: ${toMessage(error)}`, postedOrders: [], offers: [], offerResponses: [] };
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Prompt chain — the agent can call multiple tools before deciding
+  // Prompt chain — the agent calls tools until it passes or exhausts budget
   // ---------------------------------------------------------------------------
 
   private async runToolChain(
     agentId: string,
     compact: CompactContext,
     callbacks?: StreamCallbacks
-  ): Promise<{ response: string; postedOrders: PostedOrder[] }> {
-    const toolResults: string[] = [];
+  ): Promise<ActiveActionResult> {
     const postedOrders: PostedOrder[] = [];
-    const maxSteps = Math.max(1, this.runtimeConfig.agentToolBudget + 1);
+    const offers: OfferAction[] = [];
+    const offerResponses: OfferResponseAction[] = [];
+    const systemPrompt = buildSystemPrompt();
+    const initialPrompt = buildActiveActionPrompt(agentId, compact, this.runtimeConfig.agentToolBudget);
 
-    for (let step = 0; step < maxSteps; step += 1) {
-      const toolsUsed = step;
-      const toolsRemaining = this.runtimeConfig.agentToolBudget - toolsUsed;
-      const isLastStep = toolsRemaining <= 0;
-      const prompt = isLastStep
-        ? buildForcedFinalPrompt(agentId, compact, toolResults)
-        : buildActiveActionPrompt(agentId, compact, toolResults, toolsRemaining);
+    callbacks?.onStart?.(systemPrompt, initialPrompt);
 
-      const schema = isLastStep
-        ? buildActiveActionSchema(false)
-        : buildActiveActionSchema(true);
+    const messages: Array<{ role: string; content: string }> = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: initialPrompt },
+    ];
 
-      const response = await this.completePrompt(prompt, {
-        callbacks,
-        format: schema,
-        temperature: 0.1
+    let fullStreamContent = "";
+    const budget = this.runtimeConfig.agentToolBudget;
+
+    for (let step = 0; step <= budget; step++) {
+      const toolsRemaining = budget - step;
+
+      const stepResponse = await this.streamMessages(messages, {
+        format: buildToolSchema(),
+        temperature: 0.1,
+        onToken: (chunk) => {
+          fullStreamContent += chunk;
+          callbacks?.onToken?.(chunk, fullStreamContent);
+        },
       });
 
-      const toolRequest = parseToolRequest(response);
+      const toolRequest = parseToolRequest(stepResponse);
       if (!toolRequest) {
-        return { response, postedOrders };
+        // Unparseable — treat as pass
+        callbacks?.onComplete?.(fullStreamContent);
+        return { trace: "Active action: could not parse; defaulting to pass.", postedOrders, offers, offerResponses };
       }
 
+      // Terminal tools — end the turn
+      if (toolRequest.tool === "pass") {
+        callbacks?.onComplete?.(fullStreamContent);
+        return { trace: "Active action: pass.", postedOrders, offers, offerResponses };
+      }
+
+      if (toolRequest.tool === "make_offer") {
+        const { targetAgentId, giveItemIds, requestItemIds, cashFromProposer, message } = toolRequest;
+        offers.push({ targetAgentId, giveItemIds, requestItemIds, cashFromProposer, message });
+        const toolResult = `Tool result: make_offer\nOffer sent to ${targetAgentId}: give [${giveItemIds.join(", ")}] for [${requestItemIds.join(", ")}].`;
+        messages.push({ role: "assistant", content: stepResponse });
+        messages.push({ role: "user", content: toolResult });
+        const sep = `\n\n${toolResult}\n\n`;
+        fullStreamContent += sep;
+        callbacks?.onToken?.(sep, fullStreamContent);
+        // After making an offer, continue — agent can still use remaining tools
+        continue;
+      }
+
+      if (toolRequest.tool === "respond_to_offer") {
+        const result = executeRespondToOffer(compact, toolRequest, offerResponses);
+        messages.push({ role: "assistant", content: stepResponse });
+        messages.push({ role: "user", content: result });
+        const sep = `\n\n${result}\n\n`;
+        fullStreamContent += sep;
+        callbacks?.onToken?.(sep, fullStreamContent);
+        continue;
+      }
+
+      // Information/order tools
       const toolResult = executeToolRequest(compact, toolRequest, postedOrders);
-      toolResults.push(toolResult);
+
+      messages.push({ role: "assistant", content: stepResponse });
+
+      const nextRemaining = toolsRemaining - 1;
+      const nudge = nextRemaining <= 0
+        ? "No more tool calls available. Your turn ends now."
+        : `${nextRemaining} tool call${nextRemaining === 1 ? "" : "s"} remaining.`;
+
+      messages.push({ role: "user", content: `${toolResult}\n\n${nudge}` });
+
+      const separator = `\n\n${toolResult}\n\n`;
+      fullStreamContent += separator;
+      callbacks?.onToken?.(separator, fullStreamContent);
     }
 
-    return { response: '{"type":"pass"}', postedOrders };
+    // Budget exhausted — implicit pass
+    callbacks?.onComplete?.(fullStreamContent);
+    return { trace: "Active action: budget exhausted, implicit pass.", postedOrders, offers, offerResponses };
   }
 
-  private async normalizeActiveAction(
-    agentId: string,
-    compact: CompactContext,
-    response: string
-  ): Promise<{ kind: "pass"; trace: string } | { kind: "offer"; offer: MakeOfferPayload; trace: string }> {
-    const payload = extractActionObject(response);
 
-    if (payload?.type === "make_offer") {
-      const offer = parseMakeOfferPayload(payload);
-      if (offer) {
-        return { kind: "offer", offer, trace: "Active action generated by Ollama." };
-      }
+  private async streamMessages(
+    messages: Array<{ role: string; content: string }>,
+    options: {
+      format?: "json" | Record<string, unknown>;
+      temperature?: number;
+      onToken?: (chunk: string) => void;
     }
-
-    if (payload?.type === "pass" || isPass(response)) {
-      return { kind: "pass", trace: "Active action: pass." };
-    }
-
-    const repaired = await this.completePrompt(
-      buildActiveRecoveryPrompt(agentId, compact, response),
-      { systemPrompt: buildRecoverySystemPrompt(), temperature: 0.1 }
-    );
-
-    if (isPass(repaired) || extractActionObject(repaired)?.type === "pass") {
-      return { kind: "pass", trace: "Active action: pass (recovered)." };
-    }
-
-    const repairedPayload = extractActionObject(repaired);
-    if (repairedPayload?.type === "make_offer") {
-      const offer = parseMakeOfferPayload(repairedPayload);
-      if (offer) {
-        return { kind: "offer", offer, trace: "Active action translated from malformed Ollama output." };
-      }
-    }
-
-    return { kind: "pass", trace: "Active action: could not parse; defaulting to pass." };
-  }
-
-  private async normalizeOfferResponse(agentId: string, compact: CompactContext, response: string): Promise<OfferResponseResult> {
-    const payload = extractActionObject(response);
-
-    if (payload?.type === "accept") {
-      return { kind: "accept", trace: "Offer accepted by Ollama." };
-    }
-
-    if (payload?.type === "reject") {
-      const reason = typeof payload.reason === "string" ? payload.reason.trim() : "No reason given.";
-      return { kind: "reject", reason, trace: "Offer rejected by Ollama." };
-    }
-
-    if (payload?.type === "counter") {
-      const counter = parseCounterPayload(payload);
-      if (counter) {
-        return { kind: "counter", counter, trace: "Counter-offer generated by Ollama." };
-      }
-    }
-
-    const repaired = await this.completePrompt(
-      buildOfferResponseRecoveryPrompt(agentId, compact, response),
-      { systemPrompt: buildRecoverySystemPrompt(), temperature: 0.1 }
-    );
-
-    const repairedPayload = extractActionObject(repaired);
-
-    if (repairedPayload?.type === "accept") {
-      return { kind: "accept", trace: "Offer accepted (recovered)." };
-    }
-
-    if (repairedPayload?.type === "reject") {
-      const reason = typeof repairedPayload.reason === "string" ? repairedPayload.reason.trim() : "No reason given.";
-      return { kind: "reject", reason, trace: "Offer rejected (recovered)." };
-    }
-
-    if (repairedPayload?.type === "counter") {
-      const counter = parseCounterPayload(repairedPayload);
-      if (counter) {
-        return { kind: "counter", counter, trace: "Counter-offer translated from malformed Ollama output." };
-      }
-    }
-
-    return { kind: "reject", reason: "Could not parse response.", trace: "Offer response parsing failed; defaulting to reject." };
-  }
-
-  private async completePrompt(prompt: string, options: PromptOptions = {}) {
-    const systemPrompt = options.systemPrompt ?? buildSystemPrompt();
-    options.callbacks?.onStart?.(systemPrompt, prompt);
-
+  ): Promise<string> {
     const response = await fetch(`${this.runtimeConfig.ollamaBaseUrl}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -370,12 +274,9 @@ export class AgentRuntime {
         stream: true,
         keep_alive: "30m",
         format: options.format,
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: prompt }
-        ],
-        options: { temperature: options.temperature ?? 0.9 }
-      })
+        messages,
+        options: { temperature: options.temperature ?? 0.9 },
+      }),
     });
 
     if (!response.ok) {
@@ -386,7 +287,39 @@ export class AgentRuntime {
       throw new Error("Ollama returned no response body.");
     }
 
-    return readStreamedContent(response.body, options.callbacks);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let stepContent = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        const payload = JSON.parse(trimmed) as {
+          message?: { content?: string };
+          error?: string;
+        };
+
+        if (payload.error) throw new Error(payload.error);
+
+        const chunk = payload.message?.content ?? "";
+        if (chunk) {
+          stepContent += chunk;
+          options.onToken?.(chunk);
+        }
+      }
+    }
+
+    return stepContent;
   }
 }
 
@@ -397,21 +330,13 @@ export class AgentRuntime {
 function buildSystemPrompt() {
   return [
     "You are a trading agent in a marketplace simulation.",
+    "On your turn, use tools FIRST to gather market information, then choose a final action.",
     "Return exactly one JSON object — no prose, no markdown fences, no extra text.",
     "The \"message\" field is public — write it in your character's voice, at least one sentence.",
     "Keep valuations and budget secret in messages. Stay in character."
   ].join(" ");
 }
 
-function buildRecoverySystemPrompt() {
-  return [
-    "You translate messy agent output into one allowed machine-readable result.",
-    "Return only the normalized result.",
-    "Do not explain your reasoning.",
-    "Do not add markdown fences.",
-    "If the text cannot be mapped with high confidence, return INVALID."
-  ].join(" ");
-}
 
 // =============================================================================
 // Context building
@@ -419,18 +344,38 @@ function buildRecoverySystemPrompt() {
 
 function buildCompactContext(visibleState: AgentVisibleState): CompactContext {
   const selfAgent = visibleState.self;
+  const self = selfAgent
+    ? {
+        id: selfAgent.id,
+        name: selfAgent.name,
+        persona: selfAgent.persona,
+        budget: selfAgent.budget,
+        inventory: [...selfAgent.inventory],
+        wishlist: [...selfAgent.wishlist],
+        valuations: { ...selfAgent.valuations },
+      }
+    : null;
+
+  const incomingOffers: IncomingOfferSummary[] = visibleState.incomingOffers.map((offer) => {
+    const guidance = buildOfferGuidance({ self } as CompactContext, {
+      fromAgentId: offer.fromAgentId,
+      giveItemIds: offer.giveItemIds,
+      requestItemIds: offer.requestItemIds,
+      cashFromProposer: offer.cashFromProposer,
+    });
+    return {
+      offerId: offer.id,
+      fromAgentId: offer.fromAgentId,
+      giveItemIds: [...offer.giveItemIds],
+      requestItemIds: [...offer.requestItemIds],
+      cashFromProposer: offer.cashFromProposer,
+      message: offer.message,
+      guidance,
+    };
+  });
+
   return {
-    self: selfAgent
-      ? {
-          id: selfAgent.id,
-          name: selfAgent.name,
-          persona: selfAgent.persona,
-          budget: selfAgent.budget,
-          inventory: [...selfAgent.inventory],
-          wishlist: [...selfAgent.wishlist],
-          valuations: { ...selfAgent.valuations },
-        }
-      : null,
+    self,
     otherAgents: visibleState.publicAgents
       .filter((agent) => agent.id !== selfAgent?.id)
       .map((agent) => ({ id: agent.id, name: agent.name })),
@@ -444,6 +389,7 @@ function buildCompactContext(visibleState: AgentVisibleState): CompactContext {
       cashFromProposer: offer.cashFromProposer,
       message: offer.message,
     })),
+    incomingOffers,
     recentTrades: visibleState.publicTradeEvents.slice(0, 6).map((event) => event.content),
   };
 }
@@ -521,7 +467,7 @@ function computeSuggestions(compact: CompactContext): {
 }
 
 // =============================================================================
-// Offer guidance (for response phase)
+// Offer guidance
 // =============================================================================
 
 function buildOfferGuidance(
@@ -577,19 +523,19 @@ function buildOfferGuidance(
 }
 
 // =============================================================================
-// Active-phase prompts
+// Prompts
 // =============================================================================
 
 function buildActiveActionPrompt(
   agentId: string,
   compact: CompactContext,
-  toolResults: string[],
-  toolsRemaining: number
+  toolBudget: number
 ) {
   const self = compact.self;
   const { sellSuggestions, buySuggestions, orderMatches } = computeSuggestions(compact);
   const sections: string[] = [];
 
+  // --- Identity ---
   sections.push([
     "=== YOU ===",
     `Agent: ${self?.name ?? agentId} (${agentId})`,
@@ -599,7 +545,37 @@ function buildActiveActionPrompt(
     `You want: ${self ? self.wishlist.map((id) => `${id} ($${self.valuations[id] ?? 0})`).join(", ") || "nothing" : "nothing"}`,
   ].join("\n"));
 
-  // Suggestions section
+  // --- Other agents directory ---
+  const otherAgentIds = compact.otherAgents.map((a) => a.id);
+  sections.push([
+    "=== OTHER AGENTS IN THE MARKET ===",
+    "These are the ONLY agents you can trade with. Use their exact ID.",
+    ...compact.otherAgents.map((a) => `  • ${a.id} (${a.name})`),
+  ].join("\n"));
+
+  // --- Incoming offers ---
+  if (compact.incomingOffers.length > 0) {
+    const offerLines: string[] = ["=== INCOMING OFFERS (you can respond to these) ==="];
+    for (const o of compact.incomingOffers) {
+      const g = o.guidance;
+      const cashDesc = o.cashFromProposer === 0
+        ? ""
+        : o.cashFromProposer > 0
+          ? ` + they pay you $${o.cashFromProposer}`
+          : ` + you pay $${Math.abs(o.cashFromProposer)}`;
+      offerLines.push(
+        `  Offer ${o.offerId} from ${o.fromAgentId}:`,
+        `    They give: [${o.giveItemIds.join(", ")}]  They want: [${o.requestItemIds.join(", ")}]${cashDesc}`,
+        `    Net value to you: ${g.netValue >= 0 ? "+" : ""}$${g.netValue}` +
+          (g.canAcceptNow ? " (settlement POSSIBLE)" : ` (BLOCKED: ${g.blockers.join("; ")})`)
+      );
+      if (o.message) offerLines.push(`    Message: "${o.message}"`);
+    }
+    offerLines.push("  Use respond_to_offer tool with the offerId to accept, reject, or counter.");
+    sections.push(offerLines.join("\n"));
+  }
+
+  // --- Suggestions ---
   const sugParts: string[] = ["=== STRATEGY SUGGESTIONS (private to you) ==="];
   if (sellSuggestions.length > 0) {
     sugParts.push("Sell opportunities:");
@@ -614,10 +590,11 @@ function buildActiveActionPrompt(
     for (const s of orderMatches) sugParts.push(`  ★ ${s.action} — ${s.detail}`);
   }
   if (sellSuggestions.length + buySuggestions.length + orderMatches.length === 0) {
-    sugParts.push("No immediate opportunities found. Consider browsing orders or passing.");
+    sugParts.push("No immediate opportunities found. Use tools to browse the market.");
   }
   sections.push(sugParts.join("\n"));
 
+  // --- Pending offers ---
   sections.push([
     "=== YOUR OPEN OFFERS (do NOT duplicate these) ===",
     compact.myPendingOffers.length === 0
@@ -627,155 +604,55 @@ function buildActiveActionPrompt(
         ).join("\n"),
   ].join("\n"));
 
-  if (toolResults.length > 0) {
-    sections.push(`=== TOOL RESULTS ===\n${toolResults.join("\n\n")}`);
-  }
-
   if (compact.recentTrades.length > 0) {
     sections.push(["=== RECENT ACTIVITY ===", ...compact.recentTrades].join("\n"));
   }
 
-  sections.push([
-    `=== AVAILABLE TOOLS (${toolsRemaining} call${toolsRemaining === 1 ? "" : "s"} remaining) ===`,
-    '{"type":"tool","tool":"check_sell_orders","itemId":"solar-lens"} — see who is selling an item (omit itemId for all)',
-    '{"type":"tool","tool":"check_buy_orders","itemId":"copper-key"} — see who wants to buy an item (omit itemId for all)',
-    '{"type":"tool","tool":"check_price_history","itemId":"saffron"} — recent trades involving an item',
-    '{"type":"tool","tool":"post_sell_order","itemId":"item-id","price":25} — publicly list an item for sale',
-    '{"type":"tool","tool":"post_buy_order","itemId":"item-id","price":30} — publicly request to buy an item',
-    ...(toolsRemaining === 1 ? ["This is your LAST tool call. After this you must choose a final action."] : []),
-  ].join("\n"));
+  // --- Unified tool list ---
+  const exampleItemOwned = self?.inventory[0] ?? "item";
+  const exampleItemWanted = self?.wishlist[0] ?? "item";
+  const exampleTarget = otherAgentIds[0] ?? "agent-id";
 
-  sections.push([
-    "=== FINAL ACTIONS (when you are ready to finish your turn) ===",
-    '{"type":"pass"} — end your turn with no trade',
-    '{"type":"make_offer","targetAgentId":"ID","giveItemIds":["item"],"requestItemIds":["item"],"cashFromProposer":0,"message":"In character."}',
+  const toolLines: string[] = [
+    `=== TOOLS (${toolBudget} calls this turn) ===`,
+    "Each response must be ONE JSON tool call. Results come back before your next call.",
     "",
-    "Offers are private between you and the target. cashFromProposer > 0 = you pay; < 0 = they pay.",
-    "Only GIVE items you own. Only REQUEST items you actually want.",
-    'The "message" is public — write it in your character\'s voice.',
-  ].join("\n"));
+    "Market information:",
+    `  {"tool":"check_sell_orders"}`,
+    `  {"tool":"check_buy_orders","itemId":"${exampleItemWanted}"}`,
+    `  {"tool":"check_price_history","itemId":"${exampleItemWanted}"}`,
+    "",
+    "Post public orders:",
+    `  {"tool":"post_sell_order","itemId":"${exampleItemOwned}","price":20}`,
+    `  {"tool":"post_buy_order","itemId":"${exampleItemWanted}","price":15}`,
+    "",
+    "Private trade offers:",
+    `  {"tool":"make_offer","targetAgentId":"${exampleTarget}","giveItemIds":["${exampleItemOwned}"],"requestItemIds":["${exampleItemWanted}"],"cashFromProposer":0,"message":"In character."}`,
+  ];
 
-  sections.push(buildIdentityFooter(agentId, compact));
-
-  return sections.join("\n\n");
-}
-
-function buildForcedFinalPrompt(
-  agentId: string,
-  compact: CompactContext,
-  toolResults: string[]
-) {
-  const self = compact.self;
-  const sections: string[] = [];
-
-  sections.push([
-    "=== YOU ===",
-    `Agent: ${self?.name ?? agentId} (${agentId})`,
-    `Budget: $${self?.budget ?? 0}`,
-    `You own: ${self?.inventory.join(", ") || "nothing"}`,
-    `You want: ${self?.wishlist.join(", ") || "nothing"}`,
-  ].join("\n"));
-
-  if (toolResults.length > 0) {
-    sections.push(`=== TOOL RESULTS ===\n${toolResults.join("\n\n")}`);
+  if (compact.incomingOffers.length > 0) {
+    const exOffer = compact.incomingOffers[0];
+    toolLines.push(
+      "",
+      "Respond to incoming offers:",
+      `  {"tool":"respond_to_offer","offerId":"${exOffer.offerId}","decision":"accept"}`,
+      `  {"tool":"respond_to_offer","offerId":"${exOffer.offerId}","decision":"reject","reason":"short reason"}`,
+      `  {"tool":"respond_to_offer","offerId":"${exOffer.offerId}","decision":"counter","giveItemIds":["${exampleItemOwned}"],"requestItemIds":["${exampleItemWanted}"],"cashFromProposer":0,"message":"Counter."}`,
+    );
   }
 
-  sections.push([
-    "=== OPEN OFFERS (do NOT duplicate) ===",
-    compact.myPendingOffers.length === 0
-      ? "None."
-      : compact.myPendingOffers.map((o) =>
-          `To ${o.toAgentId}: give [${o.giveItemIds.join(", ")}] for [${o.requestItemIds.join(", ") || "nothing"}]`
-        ).join("\n"),
-  ].join("\n"));
-
-  sections.push([
-    "No more tool calls allowed. Choose your FINAL action NOW:",
-    '{"type":"pass"}',
-    '{"type":"make_offer","targetAgentId":"ID","giveItemIds":["item"],"requestItemIds":["item"],"cashFromProposer":0,"message":"In character."}',
-    "Return exactly one JSON object.",
-  ].join("\n"));
-
-  sections.push(buildIdentityFooter(agentId, compact));
-
-  return sections.join("\n\n");
-}
-
-// =============================================================================
-// Offer-response prompt
-// =============================================================================
-
-function buildOfferResponsePrompt(
-  agentId: string,
-  compact: CompactContext,
-  incomingOffer: IncomingOfferContext
-) {
-  const self = compact.self;
-  const g = incomingOffer.guidance;
-  const sections: string[] = [];
-
-  sections.push([
-    "=== YOU ===",
-    `Agent: ${self?.name ?? agentId} (${agentId})`,
-    `Persona: ${self?.persona ?? ""}`,
-    `Budget: $${self?.budget ?? 0}`,
-    `You own: ${self?.inventory.join(", ") || "nothing"}`,
-    `You want: ${self?.wishlist.join(", ") || "nothing"}`,
-  ].join("\n"));
-
-  const giveNames = incomingOffer.giveItemIds.join(", ") || "nothing";
-  const requestNames = incomingOffer.requestItemIds.join(", ") || "nothing";
-  const cashDesc = incomingOffer.cashFromProposer === 0
-    ? "none"
-    : incomingOffer.cashFromProposer > 0
-      ? `they pay you $${incomingOffer.cashFromProposer}`
-      : `you pay $${Math.abs(incomingOffer.cashFromProposer)}`;
-
-  sections.push([
-    "=== INCOMING OFFER ===",
-    `From: ${incomingOffer.fromAgentId}`,
-    `They give you: ${giveNames}`,
-    `They want from you: ${requestNames}`,
-    `Cash: ${cashDesc}`,
-    ...(incomingOffer.message ? [`Their message: "${incomingOffer.message}"`] : []),
-  ].join("\n"));
-
-  const wishlistSet = new Set(self?.wishlist ?? []);
-  const analysis: string[] = ["=== TRADE ANALYSIS ==="];
-  const receivingWishlist = incomingOffer.giveItemIds.filter((id) => wishlistSet.has(id));
-  const receivingOther = incomingOffer.giveItemIds.filter((id) => !wishlistSet.has(id));
-  const givingNonWishlist = incomingOffer.requestItemIds.filter((id) => !wishlistSet.has(id));
-  const givingWishlist = incomingOffer.requestItemIds.filter((id) => wishlistSet.has(id));
-
-  if (receivingWishlist.length > 0) analysis.push(`+ You receive ${receivingWishlist.join(", ")} — ON your wishlist`);
-  if (receivingOther.length > 0) analysis.push(`  You receive ${receivingOther.join(", ")} — not on wishlist`);
-  if (givingNonWishlist.length > 0) analysis.push(`+ You give ${givingNonWishlist.join(", ")} — NOT on your wishlist (fine to trade)`);
-  if (givingWishlist.length > 0) analysis.push(`- You give ${givingWishlist.join(", ")} — ON your wishlist (losing a desired item!)`);
-
-  analysis.push(`Value you gain: $${g.valueIReceive}`);
-  analysis.push(`Value you lose: $${g.valueIGive}`);
-  analysis.push(`Net value: ${g.netValue >= 0 ? "+" : ""}$${g.netValue}`);
-
-  if (g.canAcceptNow) {
-    analysis.push("Settlement: POSSIBLE — you own the requested items");
-  } else {
-    analysis.push(`Settlement: BLOCKED — ${g.blockers.join("; ")}`);
-  }
-
-  sections.push(analysis.join("\n"));
-
-  sections.push([
-    "=== DECIDE ===",
-    '{"type":"accept"} — settle the trade as-is',
-    '{"type":"reject","reason":"short reason"} — decline',
-    '{"type":"counter","giveItemIds":["item"],"requestItemIds":["item"],"cashFromProposer":0,"message":"In character."}',
+  toolLines.push(
     "",
-    "Consider countering to negotiate better terms before accepting.",
-    "If countering: only give items YOU own, only request items on YOUR wishlist.",
-    "Use cashFromProposer to balance value differences (> 0 = you pay, < 0 = they pay).",
-    'The "message" field is public — write in your persona\'s voice.',
-    "Return exactly one JSON object.",
-  ].join("\n"));
+    "End your turn:",
+    `  {"tool":"pass"}`,
+    "",
+    "RULES:",
+    `  • targetAgentId MUST be one of: ${otherAgentIds.join(", ")}`,
+    "  • Only GIVE items you own. Only REQUEST items you want.",
+    "  • cashFromProposer > 0 means you pay; < 0 means they pay.",
+    "  • Gather information before making offers.",
+  );
+  sections.push(toolLines.join("\n"));
 
   sections.push(buildIdentityFooter(agentId, compact));
 
@@ -783,34 +660,8 @@ function buildOfferResponsePrompt(
 }
 
 // =============================================================================
-// Recovery prompts
+// Identity footer
 // =============================================================================
-
-function buildActiveRecoveryPrompt(agentId: string, compact: CompactContext, candidate: string) {
-  return [
-    `Normalize ${agentId}'s active-turn candidate into one allowed output.`,
-    "Return exactly one of these outputs:",
-    '{"type":"pass"}',
-    '{"type":"make_offer","targetAgentId":"iara","giveItemIds":["reef-glass"],"requestItemIds":["solar-lens"],"cashFromProposer":0,"message":"Clean swap."}',
-    "INVALID",
-    `Known agents:\n${compact.otherAgents.map((a) => `- ${a.id}: ${a.name}`).join("\n")}`,
-    `Known items:\n${compact.items.map((i) => `- ${i.id}: ${i.name}`).join("\n")}`,
-    `Candidate:\n${candidate}`
-  ].join("\n\n");
-}
-
-function buildOfferResponseRecoveryPrompt(agentId: string, compact: CompactContext, candidate: string) {
-  return [
-    `Normalize ${agentId}'s offer-response candidate into one allowed output.`,
-    "Return exactly one of these outputs:",
-    '{"type":"accept"}',
-    '{"type":"reject","reason":"short reason"}',
-    '{"type":"counter","giveItemIds":["repair-kit"],"requestItemIds":["solar-lens"],"cashFromProposer":0,"message":"Counter."}',
-    "INVALID",
-    `Known items:\n${compact.items.map((i) => `- ${i.id}: ${i.name}`).join("\n")}`,
-    `Candidate:\n${candidate}`
-  ].join("\n\n");
-}
 
 function buildIdentityFooter(agentId: string, compact: CompactContext) {
   return [
@@ -822,12 +673,12 @@ function buildIdentityFooter(agentId: string, compact: CompactContext) {
 }
 
 // =============================================================================
-// Tool execution
+// Tool parsing and execution
 // =============================================================================
 
 function parseToolRequest(value: string): ToolRequest | null {
-  const payload = extractActionObject(value);
-  if (!payload || payload.type !== "tool") return null;
+  const payload = extractJson(value);
+  if (!payload) return null;
 
   const tool = typeof payload.tool === "string" ? payload.tool : "";
 
@@ -850,6 +701,32 @@ function parseToolRequest(value: string): ToolRequest | null {
         itemId: typeof payload.itemId === "string" ? payload.itemId.trim() : "",
         price: typeof payload.price === "number" ? payload.price : 0,
       };
+    case "make_offer": {
+      const targetAgentId = typeof payload.targetAgentId === "string" ? payload.targetAgentId.trim() : "";
+      const giveItemIds = coerceStringArray(payload.giveItemIds) ?? [];
+      const requestItemIds = coerceStringArray(payload.requestItemIds) ?? [];
+      const cashFromProposer = coerceNumber(payload.cashFromProposer) ?? 0;
+      const message = typeof payload.message === "string" ? payload.message.trim() : "Offer.";
+      if (!targetAgentId) return null;
+      return { tool: "make_offer", targetAgentId, giveItemIds, requestItemIds, cashFromProposer, message };
+    }
+    case "respond_to_offer": {
+      const offerId = typeof payload.offerId === "string" ? payload.offerId.trim() : "";
+      const decision = typeof payload.decision === "string" ? payload.decision.trim() : "";
+      if (!offerId || (decision !== "accept" && decision !== "reject" && decision !== "counter")) return null;
+      return {
+        tool: "respond_to_offer",
+        offerId,
+        decision: decision as "accept" | "reject" | "counter",
+        reason: typeof payload.reason === "string" ? payload.reason.trim() : undefined,
+        giveItemIds: coerceStringArray(payload.giveItemIds) ?? undefined,
+        requestItemIds: coerceStringArray(payload.requestItemIds) ?? undefined,
+        cashFromProposer: coerceNumber(payload.cashFromProposer) ?? undefined,
+        message: typeof payload.message === "string" ? payload.message.trim() : undefined,
+      };
+    }
+    case "pass":
+      return { tool: "pass" };
     default:
       return null;
   }
@@ -923,6 +800,46 @@ function executeToolRequest(
       postedOrders.push({ type: "buy", itemId, price });
       return `Tool result: post_buy_order\nBuy order posted: requesting ${itemId} for $${price}. Other agents can now see this on the order book.`;
     }
+
+    default:
+      return `Tool result: unknown tool.`;
+  }
+}
+
+function executeRespondToOffer(
+  compact: CompactContext,
+  request: Extract<ToolRequest, { tool: "respond_to_offer" }>,
+  offerResponses: OfferResponseAction[]
+): string {
+  const offer = compact.incomingOffers.find((o) => o.offerId === request.offerId);
+  if (!offer) {
+    return `Tool result: respond_to_offer\nError: No incoming offer with id "${request.offerId}".`;
+  }
+
+  switch (request.decision) {
+    case "accept":
+      if (!offer.guidance.canAcceptNow) {
+        return `Tool result: respond_to_offer\nError: Cannot accept — ${offer.guidance.blockers.join("; ")}`;
+      }
+      offerResponses.push({ offerId: request.offerId, kind: "accept" });
+      return `Tool result: respond_to_offer\nYou accepted offer ${request.offerId} from ${offer.fromAgentId}.`;
+
+    case "reject":
+      offerResponses.push({ offerId: request.offerId, kind: "reject", reason: request.reason ?? "Declined." });
+      return `Tool result: respond_to_offer\nYou rejected offer ${request.offerId} from ${offer.fromAgentId}.`;
+
+    case "counter": {
+      const giveItemIds = request.giveItemIds ?? [];
+      const requestItemIds = request.requestItemIds ?? [];
+      const cashFromProposer = request.cashFromProposer ?? 0;
+      const message = request.message ?? "Counter offer.";
+      offerResponses.push({
+        offerId: request.offerId,
+        kind: "counter",
+        counter: { giveItemIds, requestItemIds, cashFromProposer, message },
+      });
+      return `Tool result: respond_to_offer\nYou countered offer ${request.offerId}. Give [${giveItemIds.join(", ")}] for [${requestItemIds.join(", ")}].`;
+    }
   }
 }
 
@@ -930,46 +847,30 @@ function executeToolRequest(
 // JSON schemas
 // =============================================================================
 
-function buildActiveActionSchema(includeTool: boolean) {
-  const typeValues: string[] = ["pass", "make_offer"];
-  const properties: Record<string, unknown> = {
-    targetAgentId: { type: "string" },
-    giveItemIds: { type: "array", items: { type: "string" } },
-    requestItemIds: { type: "array", items: { type: "string" } },
-    cashFromProposer: { type: "number" },
-    message: { type: "string" }
-  };
-
-  if (includeTool) {
-    typeValues.push("tool");
-    properties.tool = { type: "string", enum: ["check_sell_orders", "check_buy_orders", "check_price_history", "post_sell_order", "post_buy_order"] };
-    properties.itemId = { type: "string" };
-    properties.price = { type: "number" };
-  }
-
+function buildToolSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["type"],
+    required: ["tool"],
     properties: {
-      type: { type: "string", enum: typeValues },
-      ...properties
-    }
-  };
-}
-
-function buildOfferResponseActionSchema() {
-  return {
-    type: "object",
-    additionalProperties: false,
-    required: ["type"],
-    properties: {
-      type: { type: "string", enum: ["accept", "reject", "counter"] },
-      reason: { type: "string" },
+      tool: {
+        type: "string",
+        enum: [
+          "check_sell_orders", "check_buy_orders", "check_price_history",
+          "post_sell_order", "post_buy_order",
+          "make_offer", "respond_to_offer", "pass"
+        ]
+      },
+      itemId: { type: "string" },
+      price: { type: "number" },
+      targetAgentId: { type: "string" },
       giveItemIds: { type: "array", items: { type: "string" } },
       requestItemIds: { type: "array", items: { type: "string" } },
       cashFromProposer: { type: "number" },
-      message: { type: "string" }
+      message: { type: "string" },
+      offerId: { type: "string" },
+      decision: { type: "string", enum: ["accept", "reject", "counter"] },
+      reason: { type: "string" }
     }
   };
 }
@@ -978,40 +879,6 @@ function buildOfferResponseActionSchema() {
 // Parsing helpers
 // =============================================================================
 
-function parseMakeOfferPayload(payload: Record<string, unknown> & { type: string }): MakeOfferPayload | null {
-  const targetAgentId = typeof payload.targetAgentId === "string" ? payload.targetAgentId.trim() : "";
-  const message = typeof payload.message === "string" ? payload.message.trim() : "";
-  const cashFromProposer = coerceNumber(payload.cashFromProposer);
-  const giveItemIds = coerceStringArray(payload.giveItemIds);
-  const requestItemIds = coerceStringArray(payload.requestItemIds);
-
-  if (!targetAgentId || cashFromProposer === null || !giveItemIds || !requestItemIds) {
-    return null;
-  }
-
-  return { targetAgentId, giveItemIds, requestItemIds, cashFromProposer, message: message || "Offer." };
-}
-
-function parseCounterPayload(payload: Record<string, unknown> & { type: string }): CounterOfferPayload | null {
-  const message = typeof payload.message === "string" ? payload.message.trim() : "";
-  const cashFromProposer = coerceNumber(payload.cashFromProposer);
-  const giveItemIds = coerceStringArray(payload.giveItemIds);
-  const requestItemIds = coerceStringArray(payload.requestItemIds);
-
-  if (cashFromProposer === null || !giveItemIds || !requestItemIds) {
-    return null;
-  }
-
-  return { giveItemIds, requestItemIds, cashFromProposer, message: message || "Counter offer." };
-}
-
-function isPass(value: string) {
-  return matchesControlWord(value, "PASS");
-}
-
-function matchesControlWord(value: string, word: string) {
-  return new RegExp(`^${word}(?:\\b|\\s|[.!?,:;])`, "i").test(value.trim());
-}
 
 function extractJson(value: string) {
   const trimmed = value.trim();
@@ -1024,12 +891,6 @@ function extractJson(value: string) {
   } catch {
     return null;
   }
-}
-
-function extractActionObject(value: string) {
-  const payload = extractJson(value);
-  if (!payload || typeof payload.type !== "string") return null;
-  return payload as Record<string, unknown> & { type: string };
 }
 
 function coerceNumber(value: unknown) {
@@ -1057,52 +918,3 @@ function toMessage(error: unknown) {
 // Streaming
 // =============================================================================
 
-async function readStreamedContent(body: ReadableStream<Uint8Array>, callbacks?: StreamCallbacks) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let aggregate = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      const payload = JSON.parse(trimmed) as {
-        message?: { content?: string };
-        error?: string;
-      };
-
-      if (payload.error) throw new Error(payload.error);
-
-      const chunk = payload.message?.content ?? "";
-      if (chunk) {
-        aggregate += chunk;
-        callbacks?.onToken?.(chunk, aggregate);
-      }
-    }
-  }
-
-  if (buffer.trim()) {
-    const payload = JSON.parse(buffer.trim()) as {
-      message?: { content?: string };
-      error?: string;
-    };
-    if (payload.error) throw new Error(payload.error);
-    const chunk = payload.message?.content ?? "";
-    if (chunk) {
-      aggregate += chunk;
-      callbacks?.onToken?.(chunk, aggregate);
-    }
-  }
-
-  callbacks?.onComplete?.(aggregate);
-  return aggregate;
-}

@@ -17,7 +17,7 @@ type LlmStreamUpdate = {
   streamId: string;
   agentId: string;
   tickCount: number;
-  stage: "active" | "offer-response";
+  stage: "active";
   phase: "started" | "delta" | "completed" | "error";
   content: string;
   systemPrompt?: string;
@@ -153,7 +153,6 @@ export class SimulationService {
         createdAt: new Date().toISOString()
       });
 
-      await this.runResponsePhase(workingState, emittedEvents, tickNumber, agentIds);
       await this.runActivePhase(workingState, emittedEvents, tickNumber, agentIds);
 
       workingState.doneAgentIds = [];
@@ -191,149 +190,13 @@ export class SimulationService {
     }
   }
 
-  private async runResponsePhase(
-    workingState: MarketState,
-    emittedEvents: MarketEvent[],
-    tickNumber: number,
-    agentIds: string[]
-  ) {
-    workingState.turnAgentId = "offer-responses";
-
-    for (const agentId of agentIds) {
-      const openOffers = workingState.offers.filter(
-        (offer) => offer.status === "open" && offer.toAgentId === agentId
-      );
-
-      for (const offer of openOffers) {
-        const result = await this.runtime.generateOfferResponse(
-          workingState,
-          agentId,
-          {
-            offerId: offer.id,
-            fromAgentId: offer.fromAgentId,
-            giveItemIds: offer.giveItemIds,
-            requestItemIds: offer.requestItemIds,
-            cashFromProposer: offer.cashFromProposer,
-            message: offer.message
-          },
-          this.createStreamCallbacks(tickNumber, agentId, "offer-response")
-        );
-
-        pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, result.trace));
-
-        if (result.kind === "accept") {
-          const settlement = validateTradeForSettlement(workingState, offer);
-
-          if (!settlement.ok) {
-            offer.status = "invalid";
-            offer.respondedAt = new Date().toISOString();
-            pushEvent(
-              workingState,
-              emittedEvents,
-              createDecisionEvent(
-                workingState.round,
-                agentId,
-                `${agentId} tried to accept ${offer.fromAgentId}'s offer but settlement failed: ${settlement.reason}`
-              )
-            );
-            continue;
-          }
-
-          settleTrade(workingState, offer);
-          offer.status = "settled";
-          offer.respondedAt = new Date().toISOString();
-          offer.settledAt = offer.respondedAt;
-          pushEvent(workingState, emittedEvents, {
-            id: randomUUID(),
-            round: workingState.round,
-            type: "trade",
-            visibility: "public",
-            actorAgentId: offer.fromAgentId,
-            targetAgentId: offer.toAgentId,
-            content: `${agentId} accepted ${offer.fromAgentId}'s offer and the trade settled.`,
-            createdAt: new Date().toISOString()
-          });
-          continue;
-        }
-
-        if (result.kind === "reject") {
-          offer.status = "rejected";
-          offer.respondedAt = new Date().toISOString();
-          pushEvent(
-            workingState,
-            emittedEvents,
-            createDecisionEvent(
-              workingState.round,
-              agentId,
-              `${agentId} rejected ${offer.fromAgentId}'s offer: ${result.reason}`
-            )
-          );
-          continue;
-        }
-
-        // counter
-        offer.status = "rejected";
-        offer.respondedAt = new Date().toISOString();
-        pushEvent(
-          workingState,
-          emittedEvents,
-          createDecisionEvent(workingState.round, agentId, `${agentId} countered ${offer.fromAgentId}'s offer.`)
-        );
-
-        const counterProposal = {
-          targetAgentId: offer.fromAgentId,
-          giveItemIds: result.counter.giveItemIds,
-          requestItemIds: result.counter.requestItemIds,
-          cashFromProposer: result.counter.cashFromProposer,
-          message: result.counter.message
-        };
-
-        const validation = validateTradeFromProposerPerspective(workingState, agentId, counterProposal);
-
-        if (!validation.ok) {
-          pushEvent(
-            workingState,
-            emittedEvents,
-            createDecisionEvent(workingState.round, agentId, `Counter-offer blocked: ${validation.reason}`)
-          );
-          continue;
-        }
-
-        const counterOffer: TradeOffer = {
-          id: randomUUID(),
-          fromAgentId: agentId,
-          toAgentId: offer.fromAgentId,
-          giveItemIds: [...result.counter.giveItemIds],
-          requestItemIds: [...result.counter.requestItemIds],
-          cashFromProposer: result.counter.cashFromProposer,
-          status: "open",
-          message: result.counter.message,
-          createdAt: new Date().toISOString(),
-          inResponseToOfferId: offer.id
-        };
-
-        workingState.offers.unshift(counterOffer);
-        pushEvent(workingState, emittedEvents, {
-          id: randomUUID(),
-          round: workingState.round,
-          type: "offer",
-          visibility: "public",
-          actorAgentId: agentId,
-          targetAgentId: offer.fromAgentId,
-          content: formatOfferContent(counterOffer),
-          createdAt: new Date().toISOString()
-        });
-      }
-    }
-  }
-
   private async runActivePhase(
     workingState: MarketState,
     emittedEvents: MarketEvent[],
     tickNumber: number,
     agentIds: string[]
   ) {
-    workingState.turnAgentId = "active-offers";
+    workingState.turnAgentId = "active";
 
     for (const agentId of agentIds) {
       const result = await this.runtime.generateActiveAction(
@@ -344,6 +207,7 @@ export class SimulationService {
 
       pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, result.trace));
 
+      // --- Process posted orders ---
       for (const order of result.postedOrders) {
         const marketOrder: MarketOrder = {
           id: randomUUID(),
@@ -366,44 +230,128 @@ export class SimulationService {
         });
       }
 
-      if (result.kind !== "offer") {
-        continue;
+      // --- Process outgoing offers ---
+      for (const offerAction of result.offers) {
+        const validation = validateTradeFromProposerPerspective(workingState, agentId, offerAction);
+
+        if (!validation.ok) {
+          pushEvent(
+            workingState,
+            emittedEvents,
+            createDecisionEvent(workingState.round, agentId, `Offer blocked by the game master: ${validation.reason}`)
+          );
+          continue;
+        }
+
+        const offer: TradeOffer = {
+          id: randomUUID(),
+          fromAgentId: agentId,
+          toAgentId: offerAction.targetAgentId,
+          giveItemIds: [...offerAction.giveItemIds],
+          requestItemIds: [...offerAction.requestItemIds],
+          cashFromProposer: offerAction.cashFromProposer,
+          status: "open",
+          message: offerAction.message,
+          createdAt: new Date().toISOString()
+        };
+
+        workingState.offers.unshift(offer);
+        pushEvent(workingState, emittedEvents, {
+          id: randomUUID(),
+          round: workingState.round,
+          type: "offer",
+          visibility: "public",
+          actorAgentId: agentId,
+          targetAgentId: offerAction.targetAgentId,
+          content: formatOfferContent(offer),
+          createdAt: new Date().toISOString()
+        });
       }
 
-      const validation = validateTradeFromProposerPerspective(workingState, agentId, result.offer);
+      // --- Process offer responses ---
+      for (const response of result.offerResponses) {
+        const existingOffer = workingState.offers.find((o) => o.id === response.offerId && o.status === "open");
+        if (!existingOffer) {
+          pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, `Offer ${response.offerId} no longer available.`));
+          continue;
+        }
 
-      if (!validation.ok) {
-        pushEvent(
-          workingState,
-          emittedEvents,
-          createDecisionEvent(workingState.round, agentId, `Offer blocked by the game master: ${validation.reason}`)
-        );
-        continue;
+        if (response.kind === "accept") {
+          const settlement = validateTradeForSettlement(workingState, existingOffer);
+          if (!settlement.ok) {
+            existingOffer.status = "invalid";
+            existingOffer.respondedAt = new Date().toISOString();
+            pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, `${agentId} tried to accept ${existingOffer.fromAgentId}'s offer but settlement failed: ${settlement.reason}`));
+            continue;
+          }
+          settleTrade(workingState, existingOffer);
+          existingOffer.status = "settled";
+          existingOffer.respondedAt = new Date().toISOString();
+          existingOffer.settledAt = existingOffer.respondedAt;
+          pushEvent(workingState, emittedEvents, {
+            id: randomUUID(),
+            round: workingState.round,
+            type: "trade",
+            visibility: "public",
+            actorAgentId: existingOffer.fromAgentId,
+            targetAgentId: existingOffer.toAgentId,
+            content: `${agentId} accepted ${existingOffer.fromAgentId}'s offer and the trade settled.`,
+            createdAt: new Date().toISOString()
+          });
+          continue;
+        }
+
+        if (response.kind === "reject") {
+          existingOffer.status = "rejected";
+          existingOffer.respondedAt = new Date().toISOString();
+          pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, `${agentId} rejected ${existingOffer.fromAgentId}'s offer: ${response.reason}`));
+          continue;
+        }
+
+        // counter
+        existingOffer.status = "rejected";
+        existingOffer.respondedAt = new Date().toISOString();
+        pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, `${agentId} countered ${existingOffer.fromAgentId}'s offer.`));
+
+        const counterProposal = {
+          targetAgentId: existingOffer.fromAgentId,
+          giveItemIds: response.counter.giveItemIds,
+          requestItemIds: response.counter.requestItemIds,
+          cashFromProposer: response.counter.cashFromProposer,
+          message: response.counter.message
+        };
+
+        const counterValidation = validateTradeFromProposerPerspective(workingState, agentId, counterProposal);
+        if (!counterValidation.ok) {
+          pushEvent(workingState, emittedEvents, createDecisionEvent(workingState.round, agentId, `Counter-offer blocked: ${counterValidation.reason}`));
+          continue;
+        }
+
+        const counterOffer: TradeOffer = {
+          id: randomUUID(),
+          fromAgentId: agentId,
+          toAgentId: existingOffer.fromAgentId,
+          giveItemIds: [...response.counter.giveItemIds],
+          requestItemIds: [...response.counter.requestItemIds],
+          cashFromProposer: response.counter.cashFromProposer,
+          status: "open",
+          message: response.counter.message,
+          createdAt: new Date().toISOString(),
+          inResponseToOfferId: existingOffer.id
+        };
+
+        workingState.offers.unshift(counterOffer);
+        pushEvent(workingState, emittedEvents, {
+          id: randomUUID(),
+          round: workingState.round,
+          type: "offer",
+          visibility: "public",
+          actorAgentId: agentId,
+          targetAgentId: existingOffer.fromAgentId,
+          content: formatOfferContent(counterOffer),
+          createdAt: new Date().toISOString()
+        });
       }
-
-      const offer: TradeOffer = {
-        id: randomUUID(),
-        fromAgentId: agentId,
-        toAgentId: result.offer.targetAgentId,
-        giveItemIds: [...result.offer.giveItemIds],
-        requestItemIds: [...result.offer.requestItemIds],
-        cashFromProposer: result.offer.cashFromProposer,
-        status: "open",
-        message: result.offer.message,
-        createdAt: new Date().toISOString()
-      };
-
-      workingState.offers.unshift(offer);
-      pushEvent(workingState, emittedEvents, {
-        id: randomUUID(),
-        round: workingState.round,
-        type: "offer",
-        visibility: "public",
-        actorAgentId: agentId,
-        targetAgentId: result.offer.targetAgentId,
-        content: formatOfferContent(offer),
-        createdAt: new Date().toISOString()
-      });
     }
   }
 

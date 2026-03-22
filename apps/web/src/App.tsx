@@ -16,7 +16,7 @@ type LlmStreamUpdate = {
   streamId: string;
   agentId: string;
   tickCount: number;
-  stage: "active" | "offer-response";
+  stage: "active";
   phase: "started" | "delta" | "completed" | "error";
   content: string;
   systemPrompt?: string;
@@ -45,7 +45,7 @@ const BTN_DANGER =
   "inline-flex items-center gap-1.5 rounded-full px-4 py-2.5 bg-gradient-to-br from-rose-500 to-orange-500 text-slate-900 font-bold text-sm cursor-pointer border-0 disabled:opacity-50 shrink-0";
 
 const SIDEBAR_TAB =
-  "flex flex-col items-center justify-start gap-2.5 px-3 py-5 min-h-[180px] w-11 rounded-3xl backdrop-blur-xl bg-slate-900/80 border border-white/10 shadow-2xl text-slate-400 text-[0.68rem] font-semibold uppercase tracking-[0.08em] cursor-pointer hover:bg-white/[0.08] hover:text-white transition-colors [writing-mode:vertical-rl]";
+  "flex flex-row items-center justify-start gap-2.5 px-3 py-5 min-h-[180px] w-11 rounded-3xl backdrop-blur-xl bg-slate-900/80 border border-white/10 shadow-2xl text-slate-400 text-[0.68rem] font-semibold uppercase tracking-[0.08em] cursor-pointer hover:bg-white/[0.08] hover:text-white transition-colors [writing-mode:vertical-rl]";
 
 // --- helpers -----------------------------------------------------------------
 
@@ -151,7 +151,6 @@ function StreamCard({ stream }: { stream: LiveStream }) {
         <div className="flex items-center gap-1.5">
           <Cpu size={13} className="text-sky-400 shrink-0" />
           <strong className="text-sm">{stream.agentId}</strong>
-          <span className="text-slate-500 text-[0.7rem]">{stream.stage}</span>
         </div>
         <div className="flex items-center gap-1.5">
           {isLive && <Loader2 size={12} className="text-sky-400 animate-spin" />}
@@ -342,7 +341,7 @@ export function App() {
   const stats: { label: string; value: string; icon: React.ReactNode }[] = [
     { label: "Round",  value: String(state.round),                    icon: <Play     size={12} /> },
     { label: "Ticks",  value: `${state.tickCount}/${state.maxTicks}`, icon: <Clock    size={12} /> },
-    { label: "Phase",  value: state.turnAgentId,                      icon: <Activity size={12} /> },
+    { label: "Turn",   value: state.turnAgentId,                      icon: <Activity size={12} /> },
     { label: "Status", value: state.status,                           icon: <CircleDot size={12} /> },
   ];
 
@@ -435,7 +434,7 @@ export function App() {
               <article className={`${PANEL} p-4 w-full lg:w-[280px]`}>
                 <div className="flex justify-between items-center mb-4">
                   <h2 className="m-0 text-base font-bold flex items-center gap-2">
-                    <Users size={15} className="text-slate-400" /> Agents
+                    <Users size={15} className="text-slate-400"/> Agents
                   </h2>
                   <div className="flex items-center gap-2">
                     <span className="text-slate-400 text-xs">{state.agents.length} active</span>
@@ -540,11 +539,12 @@ export function App() {
                 onClick={() => setAgentsOpen(true)}
                 title="Expand agents"
                 type="button"
+                style={{textOrientation: "upright"}}
               >
-                <span>Agents</span>
                 <span className="text-amber-400 font-bold text-sm [writing-mode:horizontal-tb]">
                   {state.agents.length}
                 </span>
+                <span>Agents</span>
               </button>
             )}
 
@@ -627,11 +627,12 @@ export function App() {
                 onClick={() => setOffersOpen(true)}
                 title="Expand offers"
                 type="button"
+                style={{ textOrientation: "upright"}}
               >
-                <span>Offers</span>
                 <span className="text-amber-400 font-bold text-sm [writing-mode:horizontal-tb]">
                   {state.offers.filter((o) => o.status === "open").length}
                 </span>
+                <span>Offers</span>
               </button>
             )}
           </section>
